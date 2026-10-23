@@ -27,7 +27,7 @@ All points come from one function: `scorePrediction` in `src/lib/scoring.ts`. Ma
 
 ## Entering official results (admin)
 
-The first goalscorer and first assister are typed as names (no dropdowns), and each has one of four explicit states. Nothing is pre-selected for a new result, and a blank field is never treated as "none".
+The official first goalscorer and first assister are typed as names (no dropdowns), and each has one of four explicit states. Nothing is pre-selected for a new result, and a blank field is never treated as "none".
 
 | State | Meaning | Scoring |
 |---|---|---|
@@ -36,7 +36,15 @@ The first goalscorer and first assister are typed as names (no dropdowns), and e
 | Unknown | the information isn't available | match held, nothing scored |
 | Not entered yet | to be filled in later | match held, nothing scored |
 
-**Name matching** (`src/lib/names.ts`): capitals, extra spaces, curly v straight apostrophes and dash styles don't matter, so `Bukayo Saka`, `bukayo saka` and ` Bukayo  Saka ` match. Spelling and accents do matter. A near-miss (`Martin Odegaard` v `Martin Ødegaard`, `Saka` v `Bukayo Saka`) is never scored automatically: the match is held and the admin either corrects the official name or confirms they're different players (exact matches only). There is no substring matching. When a typed name exactly matches a known player, the proper spelling is stored.
+**Members type their picks** (no player list). Each typed pick is matched only against the two official names for that match (`matchPickToOfficial` in `src/lib/names.ts`):
+
+1. **Exact** after ignoring capitals, extra spaces, curly v straight apostrophes and dash styles.
+2. **Close:** accents/punctuation ignored (`Odegaard` = `Martin Ødegaard`), whole words either way round (`Saka` = `Bukayo Saka`), or a small typo in a longer word (1 letter from 5 letters, 2 from 9: `Havetz` = `Kai Havertz`). Words under 5 letters must be spelt right (`Sakka` ≠ `Saka`).
+3. An exact match always beats a close one. A pick that is a close match for **both** official players (e.g. `Gabriel` when Martinelli scored and Magalhães assisted) holds the match for an admin, who either sets that member's pick to the full name (admin override, logged) or scores those picks as no match.
+
+**Substitutions:** the admin can record that the official first goalscorer or first assister "came on as a substitute for" another player. Picks of the replaced player then count as the substitute, for the 5-point award and the 3-point crossover. Otherwise picks never change after kick-off.
+
+**Kick-off lock:** members can edit as often as they like until the stored kick-off time. The server rejects any save at or after kick-off (database clock), and the prediction page switches to "locked" at kick-off using the server's time.
 
 **Stored breakdown:** every member's row in `fixture_scores` records the points per category plus a snapshot of their predicted score and picks and the official score and names used, so any award can be audited later.
 

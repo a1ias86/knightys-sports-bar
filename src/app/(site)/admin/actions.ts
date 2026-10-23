@@ -9,7 +9,7 @@ import { redirect } from 'next/navigation';
 import { requireAdmin } from '@/lib/session';
 import type { Actor } from '@/lib/audit';
 import * as members from '@/lib/members';
-import { createFixture, updateFixture, setFixtureAutoSync, addPlayer, setPlayerActive, seasonFor, type FixtureInput, type FixtureStatus } from '@/lib/fixtures';
+import { createFixture, updateFixture, setFixtureAutoSync, seasonFor, type FixtureInput, type FixtureStatus } from '@/lib/fixtures';
 import { saveManualResult, verifyResult, confirmNameReview, type EntryState, finaliseWithPlayerCategoriesVoid, reopenScoring, finaliseFixture, recalculateAll } from '@/lib/results';
 import { adminOverridePrediction, parseGoals } from '@/lib/predictions';
 import { updateSetting } from '@/lib/settings';
@@ -138,6 +138,8 @@ export async function manualResultAction(_p: AdminState, f: FormData): Promise<A
     scorerName: String(f.get('scorerName') ?? ''),
     assisterState: str(f, 'assisterState') as EntryState,
     assisterName: String(f.get('assisterName') ?? ''),
+    scorerReplaced: String(f.get('scorerReplaced') ?? ''),
+    assisterReplaced: String(f.get('assisterReplaced') ?? ''),
     firstGoalOwnGoal: f.get('ownGoal') === 'on',
     firstGoalUnassisted: f.get('unassisted') === 'on',
     status: (str(f, 'status') || 'finished') as FixtureStatus,
@@ -204,7 +206,9 @@ export async function overridePredictionAction(_p: AdminState, f: FormData): Pro
   const og = parseGoals(str(f, 'opponentGoals'));
   if (ag === null || og === null) return { error: 'Enter both scores.' };
   const r = await adminOverridePrediction(a, str(f, 'memberId'), id, {
-    arsenalGoals: ag, opponentGoals: og, scorer: str(f, 'scorer') || 'none', assister: str(f, 'assister') || 'none',
+    arsenalGoals: ag, opponentGoals: og,
+    scorer: f.get('scorerNone') === 'on' ? null : String(f.get('scorer') ?? ''),
+    assister: f.get('assisterNone') === 'on' ? null : String(f.get('assister') ?? ''),
   }, str(f, 'reason'));
   if (!r.ok) return { error: r.error };
   if (r.needsRescore) await finaliseFixture(id, a, 'prediction_override', { confirmReview: true });
@@ -218,21 +222,6 @@ export async function adjustmentAction(_p: AdminState, f: FormData): Promise<Adm
   const r = await members.addAdjustment(a, str(f, 'memberId'), Number(str(f, 'points')), str(f, 'reason'), str(f, 'fixtureId') || null);
   if (!r.ok) return { error: r.error };
   return done('Adjustment recorded.', '/admin/points', '/table');
-}
-
-// ─── Players ──────────────────────────────────────────────────
-
-export async function addPlayerAction(_p: AdminState, f: FormData): Promise<AdminState> {
-  const a = await actor();
-  const r = await addPlayer(a, str(f, 'name'), str(f, 'team'), str(f, 'position') || null);
-  if (!r.ok) return { error: r.error };
-  return done('Player added.', '/admin/players');
-}
-
-export async function playerActiveAction(f: FormData) {
-  const a = await actor();
-  await setPlayerActive(a, str(f, 'playerId'), str(f, 'active') === '1');
-  revalidatePath('/admin/players');
 }
 
 // ─── Settings & sync ──────────────────────────────────────────

@@ -1,9 +1,9 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { requireMember } from '@/lib/session';
-import { getFixture, isPredictionOpen, playersForFixture, hasLineup, displayStatus } from '@/lib/fixtures';
+import { getFixture, isPredictionOpen, displayStatus } from '@/lib/fixtures';
 import { getPrediction } from '@/lib/predictions';
-import { formatKickoff, formatDateTime, ukZoneLabel } from '@/lib/time';
+import { formatKickoff, formatDateTime, ukZoneLabel, serverNowMs } from '@/lib/time';
 import { Alert, StatusChip, venueText } from '@/components/bits';
 import { PredictionForm } from './PredictionForm';
 
@@ -15,16 +15,10 @@ export default async function PredictPage({ params, searchParams }: { params: Pr
   const { saved } = await searchParams;
   const fixture = await getFixture(fixtureId);
   if (!fixture || !fixture.competitionEnabled) notFound();
-  const [prediction, players, lineupOut] = await Promise.all([
-    getPrediction(fixture.id, me.id),
-    playersForFixture(fixture),
-    hasLineup(fixture.id),
-  ]);
+  const prediction = await getPrediction(fixture.id, me.id);
   const open = isPredictionOpen(fixture);
   const status = displayStatus(fixture, !!prediction);
-  const pickedNotStarting = lineupOut && prediction
-    ? [prediction.scorerPlayerId, prediction.assisterPlayerId].filter((id) => id && players.find((p) => p.id === id)?.lineupRole !== 'starter')
-    : [];
+  const serverNow = serverNowMs();
 
   return (
     <div className="stack" style={{ maxWidth: 760 }}>
@@ -41,9 +35,6 @@ export default async function PredictPage({ params, searchParams }: { params: Pr
         <Alert kind="ok">
           {saved === 'new' ? 'Prediction saved.' : 'Prediction updated.'} You can change it until kick-off.
         </Alert>
-      )}
-      {pickedNotStarting.length > 0 && open && (
-        <Alert kind="warn">Line-ups are out and one of your picks isn&rsquo;t in the starting XI. You can swap them before kick-off.</Alert>
       )}
 
       {!open ? (
@@ -64,22 +55,17 @@ export default async function PredictPage({ params, searchParams }: { params: Pr
           )}
           <Link className="btn btn-ghost" href={`/matches/${fixture.id}`}>Go to the match centre</Link>
         </section>
-      ) : players.length === 0 ? (
-        <section className="panel">
-          <h2>Player list not ready</h2>
-          <p>There are no players loaded for this match yet, so picks can&rsquo;t be made. Jon or Knighty can add them in Admin → Players.</p>
-        </section>
       ) : (
         <PredictionForm
           fixtureId={fixture.id}
           opponent={fixture.opponent}
-          lineupOut={lineupOut}
-          players={players.map((p) => ({ id: p.id, name: p.name, team: p.isArsenal ? 'Arsenal' : p.teamName, isArsenal: p.isArsenal, position: p.position, lineupRole: p.lineupRole }))}
+          kickoffAt={new Date(fixture.kickoffAt).toISOString()}
+          serverNow={serverNow}
           initial={prediction ? {
             arsenalGoals: prediction.arsenalGoals,
             opponentGoals: prediction.opponentGoals,
-            scorer: prediction.scorerNone ? 'none' : prediction.scorerPlayerId!,
-            assister: prediction.assisterNone ? 'none' : prediction.assisterPlayerId!,
+            scorer: prediction.scorerNone ? null : prediction.scorerName,
+            assister: prediction.assisterNone ? null : prediction.assisterName,
           } : null}
         />
       )}

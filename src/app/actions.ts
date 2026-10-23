@@ -39,8 +39,9 @@ export async function predictionAction(_prev: FormState, form: FormData): Promis
   const r = await savePrediction(me.id, fixtureId, {
     arsenalGoals: ag,
     opponentGoals: og,
-    scorer: String(form.get('scorer') ?? ''),
-    assister: String(form.get('assister') ?? ''),
+    // A typed name, or null only when the member explicitly ticked "No goalscorer" / "No assister".
+    scorer: form.get('scorerNone') === 'on' ? null : String(form.get('scorer') ?? ''),
+    assister: form.get('assisterNone') === 'on' ? null : String(form.get('assister') ?? ''),
   });
   if (!r.ok) return { error: r.error };
   revalidatePath('/');

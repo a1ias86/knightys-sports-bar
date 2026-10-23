@@ -14,7 +14,6 @@ import type { Actor } from '../../src/lib/audit';
 
 let jon: Actor;
 let fixtureId: string;
-const P: Record<string, string> = {};
 
 const member = async (name: string) => (await sql<{ id: string }[]>`select id from members where display_name = ${name}`)[0].id;
 const matchPoints = async (name: string) =>
@@ -41,19 +40,18 @@ function form(ag: number, og: number, scorer: string, assister: string, extra: P
 before(async () => {
   await resetDatabase();
   jon = { id: await member('Jon'), displayName: 'Jon' };
-  for (const [name, team] of [['Martin Ødegaard', 'Arsenal'], ['Ben White', 'Arsenal'], ['Kai Havertz', 'Arsenal'], ['Myles Lewis-Skelly', 'Arsenal'], ["Kieran O'Brien", 'Brentford']]) {
-    const [p] = await sql<{ id: string }[]>`insert into players (provider, name, team_name, is_arsenal) values ('manual', ${name}, ${team}, ${team === 'Arsenal'}) returning id`;
-    P[name] = p.id;
-  }
   const f = await createFixture(jon, { competitionCode: 'PL', season: '2026-27', round: '', opponent: 'Brentford', venue: 'H', kickoffAt: new Date(Date.now() + 86400_000), status: 'scheduled' });
   assert.ok(f.ok);
   if (f.ok) fixtureId = f.id;
-  const pick = async (who: string, ag: number, og: number, scorer: string, assister: string) =>
+  // Members type their picks freely: full names, surnames, missing accents, lower case.
+  const pick = async (who: string, ag: number, og: number, scorer: string | null, assister: string | null) =>
     assert.ok((await savePrediction(await member(who), fixtureId, { arsenalGoals: ag, opponentGoals: og, scorer, assister })).ok);
-  await pick('Tipple', 2, 1, P['Martin Ødegaard'], P['Ben White']);
-  await pick('Henry', 2, 1, P['Ben White'], P['Martin Ødegaard']); // crossover both ways
-  await pick('Liam', 1, 1, P['Kai Havertz'], 'none');
-  await pick('Gareth', 3, 0, P['Myles Lewis-Skelly'], P["Kieran O'Brien"]);
+  await pick('Tipple', 2, 1, 'Martin Ødegaard', 'Ben White');
+  await pick('Henry', 2, 1, 'white', 'Odegaard'); // crossover both ways, surname only, no accent
+  await pick('Liam', 1, 1, 'Havertz', null);
+  await pick('Gareth', 3, 0, 'Myles Lewis-Skelly', "Kieran O'Brien");
+  await pick('Brooksy', 1, 0, 'Trossard', 'Gabriel'); // substitution and ambiguity cases
+  await pick('Mike', 1, 0, 'Sakka', 'Saka'); // typo in a short name does not match
   await sql`update fixtures set kickoff_at = now() - interval '2 hours' where id = ${fixtureId}`;
 });
 after(async () => { await closeDb(); });
@@ -88,16 +86,15 @@ describe('Typed names are matched reliably', () => {
     const t = await scoreRow('Tipple');
     assert.deepEqual([t.scorerPoints, t.assisterPoints, t.resultPoints, t.totalGoalsPoints, t.bonusPoints, t.totalPoints], [5, 5, 1, 1, 3, 15]);
     assert.equal(t.predictedScorer, 'Martin Ødegaard');
-    assert.equal(t.officialScorer, 'Martin Ødegaard', 'stored with the proper spelling of the exact match');
     const h = await scoreRow('Henry');
-    assert.deepEqual([h.scorerPoints, h.assisterPoints, h.bonusPoints, h.totalPoints], [3, 3, 0, 8], 'both crossovers');
+    assert.deepEqual([h.scorerPoints, h.assisterPoints, h.bonusPoints, h.totalPoints], [3, 3, 0, 8], 'both crossovers via surname/no-accent picks');
     const l = await scoreRow('Liam');
     assert.equal(l.totalPoints, 0, 'Havertz wrong, "no assister" wrong, 1-1 v 2-1 wrong result and total');
   });
 
   test('members who did not predict get no score row', async () => {
     const [c] = await sql<{ n: number }[]>`select count(*)::int as n from fixture_scores where fixture_id = ${fixtureId}`;
-    assert.equal(c.n, 4);
+    assert.equal(c.n, 6);
   });
 
   test('saving the same result again does not change anything', async () => {
@@ -105,7 +102,7 @@ describe('Typed names are matched reliably', () => {
     for (let i = 0; i < 3; i++) await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
     assert.equal(await matchPoints('Tipple'), before);
     const [c] = await sql<{ n: number }[]>`select count(*)::int as n from fixture_scores where fixture_id = ${fixtureId}`;
-    assert.equal(c.n, 4);
+    assert.equal(c.n, 6);
   });
 
   test('apostrophes and hyphens: curly apostrophe and en dash still match exactly', async () => {
@@ -116,33 +113,81 @@ describe('Typed names are matched reliably', () => {
   });
 });
 
-describe('Near-miss names are flagged, never guessed', () => {
-  test('missing accent: scoring is held and earlier points are withdrawn', async () => {
+describe('Closest match to the official names', () => {
+  test('missing accent in the OFFICIAL name still matches members who typed the accent', async () => {
     const r = await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Odegaard', 'Ben White'));
-    assert.ok(r.ok && r.finalise?.status === 'blocked');
-    const s = await status();
-    assert.equal(s.scoringStatus, 'review_required');
-    assert.match(s.reviewReason!, /Tipple: "Martin Ødegaard" looks like "Martin Odegaard"/);
-    assert.equal(await matchPoints('Tipple'), 0, 'no points while names are unresolved');
-    const { rows } = await checkPredictions(fixtureId);
-    assert.equal(rows.find((x) => x.displayName === 'Tipple')!.scorerVerdict, 'review');
-    assert.equal(rows.find((x) => x.displayName === 'Henry')!.assisterVerdict, 'review');
-  });
-
-  test('admin confirms they are different players: only exact matches score', async () => {
-    const r = await confirmNameReview(jon, fixtureId);
-    assert.equal(r.status, 'finalised');
-    const t = await scoreRow('Tipple');
-    assert.deepEqual([t.scorerPoints, t.assisterPoints, t.bonusPoints, t.totalPoints], [0, 5, 0, 7]);
-    const h = await scoreRow('Henry');
-    assert.deepEqual([h.scorerPoints, h.assisterPoints, h.totalPoints], [3, 0, 5]);
-  });
-
-  test('correcting the official name re-enables the match and recalculates', async () => {
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
+    assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
     assert.equal((await scoreRow('Tipple')).totalPoints, 15);
-    const [r] = await sql<{ nameReviewConfirmed: boolean }[]>`select name_review_confirmed from match_results where fixture_id = ${fixtureId}`;
-    assert.equal(r.nameReviewConfirmed, false, 'a review decision does not carry over to different names');
+    const { rows } = await checkPredictions(fixtureId);
+    assert.equal(rows.find((x) => x.displayName === 'Tipple')!.scorerMatchNote, 'matched "Martin Odegaard"');
+  });
+
+  test('a small typo in a longer name matches; a typo in a short name does not', async () => {
+    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
+    assert.ok(r.ok && r.finalise?.status === 'finalised');
+    // Liam typed "Havertz" (exact surname): 5. Mike typed "Sakka" for the scorer and "Saka" for the assister.
+    assert.equal((await scoreRow('Liam')).scorerPoints, 5);
+    const m = await scoreRow('Mike');
+    assert.equal(m.scorerPoints, 0, '"Sakka" is not matched to anyone');
+    assert.equal(m.assisterPoints, 5, '"Saka" matches Bukayo Saka');
+  });
+
+  test('a pick that fits both official players is held for an admin, then scored as no match', async () => {
+    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Gabriel Martinelli', 'Gabriel Magalhães'));
+    assert.ok(r.ok && r.finalise?.status === 'blocked');
+    assert.match((await status()).reviewReason!, /Brooksy: "Gabriel" could be "Gabriel Magalhães" or "Gabriel Martinelli"/);
+    assert.equal(await matchPoints('Brooksy'), 0, 'nothing published while held');
+    const c = await confirmNameReview(jon, fixtureId);
+    assert.equal(c.status, 'finalised');
+    assert.equal((await scoreRow('Brooksy')).assisterPoints, 0);
+  });
+});
+
+describe('Substitutions', () => {
+  test('picking the player who was replaced counts as the substitute who scored', async () => {
+    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka', { scorerReplaced: 'Leandro Trossard' }));
+    assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
+    const b = await scoreRow('Brooksy');
+    assert.equal(b.scorerPoints, 5, 'Trossard pick → Havertz came on for Trossard and scored');
+    assert.equal(b.officialScorer, 'Kai Havertz (sub for Leandro Trossard)');
+    assert.equal((await scoreRow('Liam')).scorerPoints, 5, 'picking the substitute himself still counts');
+    const { rows } = await checkPredictions(fixtureId);
+    assert.match(rows.find((x) => x.displayName === 'Brooksy')!.scorerMatchNote!, /substitution/);
+  });
+
+  test('the substitution rule also gives the 3-point crossover', async () => {
+    await saveManualResult(jon, fixtureId, form(1, 0, 'Bukayo Saka', 'Kai Havertz', { assisterReplaced: 'Leandro Trossard' }));
+    const b = await scoreRow('Brooksy');
+    assert.equal(b.scorerPoints, 3, 'Trossard picked to score; his replacement Havertz made the first assist');
+  });
+
+  test('"came on for" is only allowed with a named player, and not for themselves', async () => {
+    const bad1 = await saveManualResult(jon, fixtureId, form(1, 0, 'Bukayo Saka', 'none', { assisterReplaced: 'Leandro Trossard' }));
+    assert.equal(bad1.ok, false);
+    const bad2 = await saveManualResult(jon, fixtureId, form(1, 0, 'Bukayo Saka', 'none', { scorerReplaced: 'bukayo saka' }));
+    assert.equal(bad2.ok, false);
+  });
+
+  test('removing the substitution recalculates without it', async () => {
+    await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
+    assert.equal((await scoreRow('Brooksy')).scorerPoints, 0);
+  });
+});
+
+describe('Kick-off lock', () => {
+  test('members can edit right up to kick-off, then the prediction is locked', async () => {
+    const f = await createFixture(jon, { competitionCode: 'PL', season: '2026-27', round: '', opponent: 'Spurs', venue: 'A', kickoffAt: new Date(Date.now() + 86400_000), status: 'scheduled' });
+    assert.ok(f.ok);
+    if (!f.ok) return;
+    const ant = await member('Ant');
+    await sql`update fixtures set kickoff_at = now() + interval '2 seconds' where id = ${f.id}`;
+    assert.ok((await savePrediction(ant, f.id, { arsenalGoals: 1, opponentGoals: 0, scorer: 'Saka', assister: null })).ok);
+    assert.ok((await savePrediction(ant, f.id, { arsenalGoals: 2, opponentGoals: 0, scorer: 'Saka', assister: 'Rice' })).ok, 'edit before kick-off');
+    await new Promise((r) => setTimeout(r, 2500));
+    const late = await savePrediction(ant, f.id, { arsenalGoals: 5, opponentGoals: 0, scorer: 'Havertz', assister: null });
+    assert.deepEqual(late, { ok: false, error: 'Predictions for this match are locked.' });
+    const [p] = await sql<{ arsenalGoals: number; assisterName: string }[]>`select arsenal_goals, assister_name from predictions where fixture_id = ${f.id} and member_id = ${ant}`;
+    assert.deepEqual(p, { arsenalGoals: 2, assisterName: 'Rice' }, 'the last edit before kick-off stands');
   });
 });
 
@@ -152,14 +197,13 @@ describe('Confirmed no assist, own goals', () => {
     const l = await scoreRow('Liam');
     assert.deepEqual([l.scorerPoints, l.assisterPoints, l.resultPoints, l.totalGoalsPoints], [5, 5, 0, 0]);
     assert.equal(l.officialAssister, '(none)');
-    const t = await scoreRow('Tipple');
-    assert.equal(t.assisterPoints, 0, 'Ben White pick is wrong when there was no assist');
+    assert.equal((await scoreRow('Tipple')).assisterPoints, 0, 'Ben White pick is wrong when there was no assist');
   });
 
   test('an own goal never credits a named goalscorer', async () => {
     const r = await saveManualResult(jon, fixtureId, form(1, 0, 'none', 'none', { firstGoalOwnGoal: true }));
     assert.ok(r.ok && r.finalise?.status === 'finalised');
-    for (const who of ['Tipple', 'Henry', 'Liam', 'Gareth']) assert.equal((await scoreRow(who)).scorerPoints, 0, who);
+    for (const who of ['Tipple', 'Henry', 'Liam', 'Gareth', 'Brooksy', 'Mike']) assert.equal((await scoreRow(who)).scorerPoints, 0, who);
   });
 });
 
@@ -176,7 +220,7 @@ describe('Security and consistency', () => {
     const tipple = await member('Tipple');
     await addAdjustment(jon, tipple, 4, 'Bonus for organising the night out', null);
     await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Odegaard', 'Ben White')); // review: points withdrawn
+    await saveManualResult(jon, fixtureId, form(2, 1, 'Gabriel Martinelli', 'Gabriel Magalhães')); // held: points withdrawn
     await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
     const [t] = await sql<{ openingPoints: number; matchPoints: number; adjustmentPoints: number; totalPoints: number }[]>`
       select opening_points, match_points, adjustment_points, total_points from member_totals where display_name = 'Tipple'`;

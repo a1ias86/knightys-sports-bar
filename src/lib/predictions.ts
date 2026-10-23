@@ -1,14 +1,15 @@
 import { sql, type Db } from './db';
 import { audit, type Actor } from './audit';
-import { getFixture, type Fixture } from './fixtures';
+import { getFixture } from './fixtures';
+import { cleanName, validateName } from './names';
 
 export interface PredictionForm {
   arsenalGoals: number;
   opponentGoals: number;
-  /** Player id, or 'none'. */
-  scorer: string;
-  /** Player id, or 'none'. */
-  assister: string;
+  /** Typed player name, or null for "No goalscorer" (0-0 only). */
+  scorer: string | null;
+  /** Typed player name, or null for "No assister". */
+  assister: string | null;
 }
 
 export interface StoredPrediction {
@@ -17,21 +18,15 @@ export interface StoredPrediction {
   memberId: string;
   arsenalGoals: number;
   opponentGoals: number;
-  scorerPlayerId: string | null;
   scorerNone: boolean;
   scorerName: string | null;
-  scorerTeam: string | null;
-  assisterPlayerId: string | null;
   assisterNone: boolean;
   assisterName: string | null;
-  assisterTeam: string | null;
   submittedAt: Date;
   updatedAt: Date;
   overrideReason: string | null;
   overrideAt: Date | null;
 }
-
-const UUID = /^[0-9a-f-]{36}$/i;
 
 export function parseGoals(v: unknown): number | null {
   if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 20 ? v : null;
@@ -44,28 +39,18 @@ export function validatePredictionForm(p: PredictionForm): string[] {
   const e: string[] = [];
   if (parseGoals(p.arsenalGoals) === null) e.push('Arsenal goals must be a whole number from 0 to 20.');
   if (parseGoals(p.opponentGoals) === null) e.push('Opponent goals must be a whole number from 0 to 20.');
-  if (p.scorer !== 'none' && !UUID.test(p.scorer)) e.push('Choose a first goalscorer.');
-  if (p.assister !== 'none' && !UUID.test(p.assister)) e.push('Choose a first assister.');
-  if (p.scorer === 'none' && !(p.arsenalGoals === 0 && p.opponentGoals === 0)) {
+  if (p.scorer !== null) { const m = validateName(p.scorer, 'First goalscorer'); if (m) e.push(m); }
+  if (p.assister !== null) { const m = validateName(p.assister, 'First assister'); if (m) e.push(m); }
+  if (p.scorer === null && !(p.arsenalGoals === 0 && p.opponentGoals === 0)) {
     e.push('"No goalscorer" can only be picked with a 0-0 score prediction.');
   }
   return e;
 }
 
-/** Check picked players exist, are active and play for Arsenal or this opponent. */
-async function validatePlayers(db: Db, f: Fixture, ids: string[]): Promise<string | null> {
-  if (!ids.length) return null;
-  const rows = await db<{ id: string }[]>`
-    select id from players
-    where id in ${db(ids)} and active and (is_arsenal or lower(team_name) = lower(${f.opponent}))`;
-  const ok = new Set(rows.map((r) => r.id));
-  return ids.every((id) => ok.has(id)) ? null : 'One of the chosen players is not available for this match.';
-}
-
 const SELECT_PREDICTION = (db: Db) => db`
   p.id, p.fixture_id, p.member_id, p.arsenal_goals, p.opponent_goals,
-  p.scorer_player_id, p.scorer_none, sp.name as scorer_name, sp.team_name as scorer_team,
-  p.assister_player_id, p.assister_none, ap.name as assister_name, ap.team_name as assister_team,
+  p.scorer_none, coalesce(p.scorer_name, sp.name) as scorer_name,
+  p.assister_none, coalesce(p.assister_name, ap.name) as assister_name,
   p.submitted_at, p.updated_at, p.override_reason, p.override_at`;
 
 export async function getPrediction(fixtureId: string, memberId: string, db: Db = sql): Promise<StoredPrediction | null> {
@@ -105,19 +90,17 @@ export async function savePrediction(memberId: string, fixtureId: string, form: 
       for share of f`;
     if (!lock) return { ok: false as const, error: 'Fixture not found.' };
     if (!lock.open) return { ok: false as const, error: 'Predictions for this match are locked.' };
-    const f = (await getFixture(fixtureId, tx))!;
-    const playerError = await validatePlayers(tx, f, [form.scorer, form.assister].filter((x) => x !== 'none'));
-    if (playerError) return { ok: false as const, error: playerError };
+    const scorer = form.scorer === null ? null : cleanName(form.scorer);
+    const assister = form.assister === null ? null : cleanName(form.assister);
     const [row] = await tx<{ created: boolean }[]>`
       insert into predictions (fixture_id, member_id, arsenal_goals, opponent_goals,
-        scorer_player_id, scorer_none, assister_player_id, assister_none)
+        scorer_name, scorer_none, assister_name, assister_none)
       values (${fixtureId}, ${memberId}, ${form.arsenalGoals}, ${form.opponentGoals},
-        ${form.scorer === 'none' ? null : form.scorer}, ${form.scorer === 'none'},
-        ${form.assister === 'none' ? null : form.assister}, ${form.assister === 'none'})
+        ${scorer}, ${scorer === null}, ${assister}, ${assister === null})
       on conflict (fixture_id, member_id) do update set
         arsenal_goals = excluded.arsenal_goals, opponent_goals = excluded.opponent_goals,
-        scorer_player_id = excluded.scorer_player_id, scorer_none = excluded.scorer_none,
-        assister_player_id = excluded.assister_player_id, assister_none = excluded.assister_none,
+        scorer_name = excluded.scorer_name, scorer_player_id = null, scorer_none = excluded.scorer_none,
+        assister_name = excluded.assister_name, assister_player_id = null, assister_none = excluded.assister_none,
         updated_at = now()
       returning (xmax = 0) as created`;
     return { ok: true as const, created: row.created };
@@ -139,20 +122,19 @@ export async function adminOverridePrediction(
     if (!f) return { ok: false as const, error: 'Fixture not found.' };
     const [m] = await tx`select 1 from members where id = ${memberId}`;
     if (!m) return { ok: false as const, error: 'Member not found.' };
-    const playerError = await validatePlayers(tx, f, [form.scorer, form.assister].filter((x) => x !== 'none'));
-    if (playerError) return { ok: false as const, error: playerError };
     const before = await getPrediction(fixtureId, memberId, tx);
+    const scorer = form.scorer === null ? null : cleanName(form.scorer);
+    const assister = form.assister === null ? null : cleanName(form.assister);
     await tx`
       insert into predictions (fixture_id, member_id, arsenal_goals, opponent_goals,
-        scorer_player_id, scorer_none, assister_player_id, assister_none, override_by, override_reason, override_at)
+        scorer_name, scorer_none, assister_name, assister_none, override_by, override_reason, override_at)
       values (${fixtureId}, ${memberId}, ${form.arsenalGoals}, ${form.opponentGoals},
-        ${form.scorer === 'none' ? null : form.scorer}, ${form.scorer === 'none'},
-        ${form.assister === 'none' ? null : form.assister}, ${form.assister === 'none'},
+        ${scorer}, ${scorer === null}, ${assister}, ${assister === null},
         ${actor.id}, ${reason.trim()}, now())
       on conflict (fixture_id, member_id) do update set
         arsenal_goals = excluded.arsenal_goals, opponent_goals = excluded.opponent_goals,
-        scorer_player_id = excluded.scorer_player_id, scorer_none = excluded.scorer_none,
-        assister_player_id = excluded.assister_player_id, assister_none = excluded.assister_none,
+        scorer_name = excluded.scorer_name, scorer_player_id = null, scorer_none = excluded.scorer_none,
+        assister_name = excluded.assister_name, assister_player_id = null, assister_none = excluded.assister_none,
         override_by = excluded.override_by, override_reason = excluded.override_reason, override_at = now(),
         updated_at = now()`;
     await audit(tx, actor, 'prediction.override', 'prediction', `${fixtureId}:${memberId}`, {
@@ -179,7 +161,8 @@ export async function memberPredictionHistory(memberId: string, limit = 50) {
     resultArsenal: number | null; resultOpponent: number | null; totalPoints: number | null;
   }[]>`
     select f.id as fixture_id, f.opponent, f.venue, f.kickoff_at, c.name as competition_name, f.status, f.scoring_status,
-      p.arsenal_goals, p.opponent_goals, sp.name as scorer_name, p.scorer_none, ap.name as assister_name, p.assister_none,
+      p.arsenal_goals, p.opponent_goals, coalesce(p.scorer_name, sp.name) as scorer_name, p.scorer_none,
+      coalesce(p.assister_name, ap.name) as assister_name, p.assister_none,
       r.arsenal_goals as result_arsenal, r.opponent_goals as result_opponent,
       case when f.scoring_status = 'finalised' then coalesce(s.total_points, 0) end as total_points
     from predictions p

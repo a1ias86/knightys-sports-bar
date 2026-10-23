@@ -14,8 +14,8 @@ const VERDICT: Record<PickVerdict, { label: string; cls: string }> = {
 
 const RESULT_WORD = { win: 'Arsenal win', draw: 'Draw', loss: 'Arsenal loss' } as const;
 
-function official(kind: StoredResult['firstScorerKind'] | undefined, name: string | null | undefined, none: string) {
-  if (kind === 'player') return name;
+function official(kind: StoredResult['firstScorerKind'] | undefined, name: string | null | undefined, none: string, replaced?: string | null) {
+  if (kind === 'player') return replaced ? `${name} (on for ${replaced})` : name;
   if (kind === 'none') return none;
   if (kind === 'unknown') return 'Unknown';
   return 'Not entered';
@@ -50,8 +50,8 @@ export function ScoringTable({ checks, scores, result, finalised, overrides }: {
           <tr className="official-row">
             <td><strong>Official</strong></td>
             <td className="num">{result ? `${result.arsenalGoals}–${result.opponentGoals} (${RESULT_WORD[actualCat!]}, ${actualTotal} goals)` : 'Not entered'}</td>
-            <td>{official(result?.firstScorerKind, result?.firstScorerName, 'No qualifying goal')}</td>
-            <td>{official(result?.firstAssisterKind, result?.firstAssisterName, 'No credited assist')}</td>
+            <td>{official(result?.firstScorerKind, result?.firstScorerName, 'No qualifying goal', result?.firstScorerReplacedName)}</td>
+            <td>{official(result?.firstAssisterKind, result?.firstAssisterName, 'No credited assist', result?.firstAssisterReplacedName)}</td>
             <td colSpan={6} className="small muted">{result?.playerCategoriesVoid ? `Scorer/assist not scored: ${result.voidReason}` : ''}</td>
           </tr>
         </thead>
@@ -72,8 +72,14 @@ export function ScoringTable({ checks, scores, result, finalised, overrides }: {
                   {c.arsenalGoals}–{c.opponentGoals}
                   <div className="small muted">{RESULT_WORD[cat]}{resultOk === null ? '' : resultOk ? ' ✓' : ' ✗'}, {c.arsenalGoals + c.opponentGoals} goals{totalOk === null ? '' : totalOk ? ' ✓' : ' ✗'}</div>
                 </td>
-                <td>{c.scorerPick ?? 'None'} <span className={`verdict ${VERDICT[c.scorerVerdict].cls}`}>{VERDICT[c.scorerVerdict].label}</span></td>
-                <td>{c.assisterPick ?? 'None'} <span className={`verdict ${VERDICT[c.assisterVerdict].cls}`}>{VERDICT[c.assisterVerdict].label}</span></td>
+                <td>
+                  {c.scorerPick ?? 'None'} <span className={`verdict ${VERDICT[c.scorerVerdict].cls}`}>{VERDICT[c.scorerVerdict].label}</span>
+                  {c.scorerMatchNote && <div className="small muted">{c.scorerMatchNote}</div>}
+                </td>
+                <td>
+                  {c.assisterPick ?? 'None'} <span className={`verdict ${VERDICT[c.assisterVerdict].cls}`}>{VERDICT[c.assisterVerdict].label}</span>
+                  {c.assisterMatchNote && <div className="small muted">{c.assisterMatchNote}</div>}
+                </td>
                 <td className="r num">{pts(s?.scorerPoints)}</td>
                 <td className="r num">{pts(s?.assisterPoints)}</td>
                 <td className="r num">{pts(s?.resultPoints)}</td>

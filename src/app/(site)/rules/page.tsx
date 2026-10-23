@@ -34,8 +34,12 @@ export default function RulesPage() {
         <p>The first player officially credited with an assist, in match order. If the first goal had no assist, it&rsquo;s the next assisted goal. The same player can be first scorer and first assister. If no goal has an assist, &ldquo;No assister&rdquo; wins.</p>
         <h3>Crossovers</h3>
         <p>If the player you picked to score made the first assist instead, you get 3 instead of 5 for that pick, and the same the other way round. Crossovers don&rsquo;t count towards the full house.</p>
-        <h3>Substitutes and line-ups</h3>
-        <p>Your picks never change after kick-off. If your player doesn&rsquo;t start, comes off or gets injured, the pick stands. When line-ups are published before kick-off the app flags picks who aren&rsquo;t starting so you can swap them in time.</p>
+        <h3>Typing your picks</h3>
+        <p>Type your goalscorer and assister however you like: &ldquo;Saka&rdquo;, &ldquo;Bukayo Saka&rdquo; or &ldquo;odegaard&rdquo; all work. Your pick is matched to the official first goalscorer and first assister for that match, allowing for capitals, missing accents, surnames only and small typos in longer names. Short names (like Rice) need spelling correctly. If your pick could be either of the two official players, Jon or Knighty decide.</p>
+        <h3>Substitutes</h3>
+        <p>If the first goalscorer or first assister came off the bench, anyone who picked the player they replaced scores as if they&rsquo;d picked the substitute (5 points, or 3 for a crossover). Otherwise picks are never changed after kick-off, whatever happens to the player.</p>
+        <h3>Deadline</h3>
+        <p>You can change your prediction as many times as you like until kick-off. At kick-off it locks and can&rsquo;t be changed.</p>
         <h3>Checking the data</h3>
         <p>Points are only added once the scorer and assist are confirmed. If the data is missing or doubtful, Jon or Knighty check it first. Postponed matches reopen when they&rsquo;re rescheduled; abandoned matches don&rsquo;t score.</p>
       </section>

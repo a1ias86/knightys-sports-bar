@@ -53,9 +53,9 @@ export default async function MatchCentre({ params }: { params: Promise<{ id: st
           </div>
           <dl className="confirm-list">
             <dt>First goalscorer</dt>
-            <dd>{result.firstScorerKind === 'player' ? result.firstScorerName : result.firstScorerKind === 'none' ? 'No qualifying goal' : 'Not confirmed yet'}</dd>
+            <dd>{result.firstScorerKind === 'player' ? `${result.firstScorerName}${result.firstScorerReplacedName ? ` (came on for ${result.firstScorerReplacedName})` : ''}` : result.firstScorerKind === 'none' ? 'No qualifying goal' : 'Not confirmed yet'}</dd>
             <dt>First assist</dt>
-            <dd>{result.firstAssisterKind === 'player' ? result.firstAssisterName : result.firstAssisterKind === 'none' ? 'No assisted goal' : 'Not confirmed yet'}</dd>
+            <dd>{result.firstAssisterKind === 'player' ? `${result.firstAssisterName}${result.firstAssisterReplacedName ? ` (came on for ${result.firstAssisterReplacedName})` : ''}` : result.firstAssisterKind === 'none' ? 'No assisted goal' : 'Not confirmed yet'}</dd>
             {result.firstGoalOwnGoal && (<><dt>Note</dt><dd>The first goal was an own goal, which doesn&rsquo;t count for goalscorer picks.</dd></>)}
             {result.playerCategoriesVoid && (<><dt>Ruling</dt><dd>Goalscorer and assist picks were not scored for this match: {result.voidReason}</dd></>)}
             {result.publicNote && (<><dt>Note</dt><dd>{result.publicNote}</dd></>)}

@@ -200,10 +200,10 @@ describe('Predictions and locking', () => {
     assert.ok(r.ok);
     if (r.ok) ids.liverpool = r.id;
     const bob = await memberId('Bob');
-    const s1 = await savePrediction(bob, ids.liverpool, { arsenalGoals: 2, opponentGoals: 1, scorer: players.Saka, assister: players.Odegaard });
+    const s1 = await savePrediction(bob, ids.liverpool, { arsenalGoals: 2, opponentGoals: 1, scorer: 'Saka', assister: 'Odegaard' });
     assert.deepEqual(s1, { ok: true, created: true });
     const first = await getPrediction(ids.liverpool, bob);
-    const s2 = await savePrediction(bob, ids.liverpool, { arsenalGoals: 3, opponentGoals: 1, scorer: players.Salah, assister: 'none' });
+    const s2 = await savePrediction(bob, ids.liverpool, { arsenalGoals: 3, opponentGoals: 1, scorer: 'Salah', assister: null });
     assert.deepEqual(s2, { ok: true, created: false });
     const second = await getPrediction(ids.liverpool, bob);
     assert.equal(second!.arsenalGoals, 3);
@@ -216,10 +216,12 @@ describe('Predictions and locking', () => {
 
   test('invalid predictions are rejected', async () => {
     const bob = await memberId('Bob');
-    assert.equal((await savePrediction(bob, ids.liverpool, { arsenalGoals: -1, opponentGoals: 0, scorer: 'none', assister: 'none' })).ok, false);
-    assert.equal((await savePrediction(bob, ids.liverpool, { arsenalGoals: 1, opponentGoals: 0, scorer: 'none', assister: 'none' })).ok, false, '"none" scorer needs 0-0');
-    const r = await savePrediction(bob, ids.liverpool, { arsenalGoals: 1, opponentGoals: 0, scorer: players.OppDefender, assister: 'none' });
-    assert.equal(r.ok, false, 'Chelsea player not in this match');
+    assert.equal((await savePrediction(bob, ids.liverpool, { arsenalGoals: -1, opponentGoals: 0, scorer: null, assister: null })).ok, false);
+    assert.equal((await savePrediction(bob, ids.liverpool, { arsenalGoals: 1, opponentGoals: 0, scorer: null, assister: null })).ok, false, '"no goalscorer" needs 0-0');
+    const r = await savePrediction(bob, ids.liverpool, { arsenalGoals: 1, opponentGoals: 0, scorer: '<b>Saka</b>', assister: null });
+    assert.equal(r.ok, false, 'names must be letters, spaces, apostrophes or hyphens');
+    const blank = await savePrediction(bob, ids.liverpool, { arsenalGoals: 1, opponentGoals: 0, scorer: '   ', assister: null });
+    assert.equal(blank.ok, false, 'a blank scorer is not "no goalscorer"');
   });
 
   test('predictions lock at the stored kickoff time', async () => {
@@ -228,9 +230,9 @@ describe('Predictions and locking', () => {
     if (!r.ok) return;
     ids.chelsea = r.id;
     const ant = await memberId('Ant');
-    assert.ok((await savePrediction(ant, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: players.Saka, assister: players.Rice })).ok);
+    assert.ok((await savePrediction(ant, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: 'Saka', assister: 'Rice' })).ok);
     await sql`update fixtures set kickoff_at = now() - interval '1 second' where id = ${r.id}`;
-    const late = await savePrediction(ant, r.id, { arsenalGoals: 5, opponentGoals: 0, scorer: players.Havertz, assister: players.Rice });
+    const late = await savePrediction(ant, r.id, { arsenalGoals: 5, opponentGoals: 0, scorer: 'Havertz', assister: 'Rice' });
     assert.deepEqual(late, { ok: false, error: 'Predictions for this match are locked.' });
     assert.equal((await getPrediction(r.id, ant))!.arsenalGoals, 1, 'locked value preserved');
   });
@@ -241,9 +243,9 @@ describe('Predictions and locking', () => {
     if (!r.ok) return;
     const tesh = await memberId('Tesh');
     await updateFixture(jon, r.id, { ...fixtureInput('Everton', inHours(5)), status: 'postponed' });
-    assert.equal((await savePrediction(tesh, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: players.Saka, assister: 'none' })).ok, false);
+    assert.equal((await savePrediction(tesh, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: 'Saka', assister: null })).ok, false);
     await updateFixture(jon, r.id, fixtureInput('Everton', inHours(24 * 10)));
-    assert.ok((await savePrediction(tesh, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: players.Saka, assister: 'none' })).ok);
+    assert.ok((await savePrediction(tesh, r.id, { arsenalGoals: 1, opponentGoals: 0, scorer: 'Saka', assister: null })).ok);
   });
 
   test('duplicate fixtures are refused', async () => {
@@ -253,9 +255,9 @@ describe('Predictions and locking', () => {
 
   test('admin override after the lock is recorded with a reason', async () => {
     const steff = await memberId('Steff');
-    const bad = await adminOverridePrediction(jon, steff, ids.chelsea, { arsenalGoals: 2, opponentGoals: 0, scorer: players.Saka, assister: players.Rice }, '');
+    const bad = await adminOverridePrediction(jon, steff, ids.chelsea, { arsenalGoals: 2, opponentGoals: 0, scorer: 'Saka', assister: 'Rice' }, '');
     assert.equal(bad.ok, false);
-    const ok = await adminOverridePrediction(jon, steff, ids.chelsea, { arsenalGoals: 2, opponentGoals: 0, scorer: players.Saka, assister: players.Rice }, 'Sent by text before kickoff');
+    const ok = await adminOverridePrediction(jon, steff, ids.chelsea, { arsenalGoals: 2, opponentGoals: 0, scorer: 'Saka', assister: 'Rice' }, 'Sent by text before kickoff');
     assert.ok(ok.ok);
     const p = await getPrediction(ids.chelsea, steff);
     assert.equal(p!.overrideReason, 'Sent by text before kickoff');
@@ -335,7 +337,7 @@ describe('Automatic feed processing', () => {
     if (!r.ok) throw new Error();
     await sql`update fixtures set provider = 'test', provider_fixture_id = ${opponent}, manual_override = false where id = ${r.id}`;
     const mark = await memberId('Mark D');
-    await savePrediction(mark, r.id, { arsenalGoals: 2, opponentGoals: 1, scorer: players.Saka, assister: players.Odegaard });
+    await savePrediction(mark, r.id, { arsenalGoals: 2, opponentGoals: 1, scorer: 'Saka', assister: 'Odegaard' });
     await kickoffNow(r.id, 'live');
     return r.id;
   }

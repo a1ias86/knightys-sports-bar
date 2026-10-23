@@ -356,3 +356,7 @@ details.inline[open] summary { margin-bottom: 12px; }
 .v-review { background: var(--warn); color: #1a1205; }
 .v-pending { background: var(--stand-2); color: var(--muted); }
 .scoring-table .official-row td { background: var(--gold-soft); border-bottom: 1px solid var(--gold); }
+.official-sub { margin: 0 0 12px 30px; }
+.official-sub label { font-weight: 500; font-size: 0.9rem; }
+@media (max-width: 520px) { .official-sub { margin-left: 0; } }
+.pick-title { font: 700 1.45rem var(--font-display); color: var(--chalk); }

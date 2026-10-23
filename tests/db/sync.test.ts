@@ -105,12 +105,10 @@ describe('Fixture synchronisation', () => {
 describe('Results synchronisation', () => {
   test('only fixtures past full time are fetched, and finished ones are scored', async () => {
     await syncSquads();
-    const saka = (await sql<{ id: string }[]>`select id from players where provider_player_id = 's1'`)[0].id;
-    const ode = (await sql<{ id: string }[]>`select id from players where provider_player_id = 's2'`)[0].id;
     await sql`update fixtures set kickoff_at = now() - interval '3 hours', manual_override = false where provider_fixture_id = '101'`;
     const [fx] = await sql<{ id: string }[]>`select id from fixtures where provider_fixture_id = '101'`;
     const [bob] = await sql<{ id: string }[]>`select id from members where display_name = 'Bob'`;
-    await sql`insert into predictions (fixture_id, member_id, arsenal_goals, opponent_goals, scorer_player_id, assister_player_id) values (${fx.id}, ${bob.id}, 1, 0, ${saka}, ${ode})`;
+    await sql`insert into predictions (fixture_id, member_id, arsenal_goals, opponent_goals, scorer_name, assister_name) values (${fx.id}, ${bob.id}, 1, 0, 'Saka', 'Odegaard')`;
     matches['101'] = {
       status: 'finished', arsenalGoals: 1, opponentGoals: 0, substitutions: [],
       goals: [{ key: 'k1', minute: 9, extraMinute: null, type: 'goal', side: 'arsenal', scorerProviderId: 's1', scorerName: 'Saka', assistStatus: 'credited', assistProviderId: 's2', assistName: 'Odegaard' }],

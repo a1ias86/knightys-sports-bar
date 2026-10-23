@@ -4,12 +4,13 @@ import type { FirstKind } from '@/lib/results';
  * Official first goalscorer / first assister entry. Four explicit states, nothing pre-selected for a new
  * result, so "no assister", "unknown" and "not entered yet" can never be confused with each other.
  */
-export function OfficialPlayerField({ role, legend, hint, kind, name, listId, noneLabel }: {
+export function OfficialPlayerField({ role, legend, hint, kind, name, replaced, listId, noneLabel }: {
   role: 'scorer' | 'assister';
   legend: string;
   hint: string;
   kind?: FirstKind;
   name?: string | null;
+  replaced?: string | null;
   listId: string;
   noneLabel: string;
 }) {
@@ -28,6 +29,14 @@ export function OfficialPlayerField({ role, legend, hint, kind, name, listId, no
           type="text" name={`${role}Name`} list={listId} defaultValue={name ?? ''} maxLength={60}
           autoComplete="off" spellCheck={false} aria-label={`${legend} name`} placeholder="e.g. Bukayo Saka"
         />
+      </div>
+      <div className="official-sub">
+        <label htmlFor={id('replaced')}>Came on as a substitute for (optional)</label>
+        <input
+          id={id('replaced')} type="text" name={`${role}Replaced`} list={listId} defaultValue={replaced ?? ''} maxLength={60}
+          autoComplete="off" spellCheck={false} placeholder="e.g. Leandro Trossard"
+        />
+        <div className="hint">Fill this in only if the named player came off the bench. Anyone who picked the player they replaced scores as if they&rsquo;d picked the substitute.</div>
       </div>
       <label className="checkbox" htmlFor={id('none')}>
         <input type="radio" id={id('none')} name={`${role}State`} value="none" defaultChecked={state === 'none'} />

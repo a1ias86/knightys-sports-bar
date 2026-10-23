@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanName, nameKey, validateName, compareNames } from '../../src/lib/names';
+import { cleanName, nameKey, validateName, matchPickToOfficial } from '../../src/lib/names';
 import { validateManualResult, type ManualResultForm } from '../../src/lib/results';
 
 describe('Name normalisation', () => {
@@ -30,26 +30,38 @@ describe('Name validation', () => {
   }
 });
 
-describe('Comparing names', () => {
+describe('Matching a typed pick to an official name', () => {
+  const m = matchPickToOfficial;
   test('exact after normalisation', () => {
-    assert.equal(compareNames(' bukayo SAKA', 'Bukayo Saka'), 'exact');
-    assert.equal(compareNames("Kieran O’Brien", "kieran o'brien"), 'exact');
+    assert.equal(m(' bukayo SAKA', 'Bukayo Saka'), 'exact');
+    assert.equal(m("Kieran O\u2019Brien", "kieran o'brien"), 'exact');
   });
-  test('accent-only difference is flagged for review, not matched', () => {
-    assert.equal(compareNames('Martin Odegaard', 'Martin Ødegaard'), 'probable');
+  test('surname only, either way round', () => {
+    assert.equal(m('Saka', 'Bukayo Saka'), 'close');
+    assert.equal(m('Bukayo Saka', 'Saka'), 'close');
+    assert.equal(m('martinelli', 'Gabriel Martinelli'), 'close');
   });
-  test('a single name inside a full name is flagged for review, not matched', () => {
-    assert.equal(compareNames('Saka', 'Bukayo Saka'), 'probable');
-    assert.equal(compareNames('Gabriel', 'Gabriel Martinelli'), 'probable');
+  test('missing accents and punctuation', () => {
+    assert.equal(m('Odegaard', 'Martin Ødegaard'), 'close');
+    assert.equal(m('Martin Odegaard', 'Martin Ødegaard'), 'close');
+    assert.equal(m('Smith Rowe', 'Emile Smith-Rowe'), 'close');
+    assert.equal(m('Magalhaes', 'Gabriel Magalhães'), 'close');
   });
-  test('hyphen v space is flagged for review', () => {
-    assert.equal(compareNames('Smith Rowe', 'Smith-Rowe'), 'probable');
+  test('small typos in longer names', () => {
+    assert.equal(m('Havetz', 'Kai Havertz'), 'close');
+    assert.equal(m('Odegard', 'Martin Ødegaard'), 'close');
+    assert.equal(m('Martinneli', 'Gabriel Martinelli'), 'close');
   });
-  test('different players sharing a first name are different (no substring matching)', () => {
-    assert.equal(compareNames('Gabriel Jesus', 'Gabriel Martinelli'), 'different');
-    assert.equal(compareNames('Ben White', 'Ben Whiteman'), 'different');
-    assert.equal(compareNames('Rice', 'Declan Rice Jr'), 'probable');
-    assert.equal(compareNames('', 'Bukayo Saka'), 'different');
+  test('short names must be spelt right', () => {
+    assert.equal(m('Sakka', 'Bukayo Saka'), 'none');
+    assert.equal(m('Sala', 'Bukayo Saka'), 'none');
+    assert.equal(m('Rise', 'Declan Rice'), 'none');
+  });
+  test('different players are not matched', () => {
+    assert.equal(m('Gabriel Jesus', 'Gabriel Martinelli'), 'none');
+    assert.equal(m('Jesus', 'Gabriel Martinelli'), 'none');
+    assert.equal(m('White', 'Declan Rice'), 'none');
+    assert.equal(m('', 'Bukayo Saka'), 'none');
   });
 });
 

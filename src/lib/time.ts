@@ -73,3 +73,8 @@ export function ukGreeting(now = new Date()): string {
   const h = Number(new Intl.DateTimeFormat('en-GB', { timeZone: UK_TZ, hour: '2-digit', hourCycle: 'h23' }).format(now));
   return h < 12 ? 'Morning' : h < 18 ? 'Afternoon' : 'Evening';
 }
+
+/** Server clock in ms (passed to the browser so countdowns use server time, not the device's clock). */
+export function serverNowMs(): number {
+  return Date.now();
+}

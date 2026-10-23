@@ -1,14 +1,13 @@
 /**
  * Player-name handling for official results and prediction matching.
  *
- * Three levels, deliberately strict:
  *  - cleanName:  what we store and show. Unicode NFC, trimmed, single spaces, consistent apostrophes/hyphens.
- *  - nameKey:    what scoring compares. cleanName + case-insensitive. "Bukayo Saka", "bukayo saka" and
- *                " Bukayo  Saka " share a key; "Martin Ødegaard" and "Martin Odegaard" do NOT.
- *  - looseKey:   accent/punctuation-insensitive form, used ONLY to spot probable mismatches for an admin to
- *                review. It never awards points.
+ *  - nameKey:    case-insensitive identity. "Bukayo Saka", "bukayo saka" and " Bukayo  Saka " share a key.
+ *  - looseKey:   accent/punctuation-insensitive form ("Ødegaard" → "odegaard"), used for close matching.
  *
- * There is no substring matching: "Gabriel" never matches "Gabriel Martinelli" automatically.
+ * Member picks are matched to the OFFICIAL names with matchPickToOfficial(): exact, then accent/punctuation
+ * insensitive, then whole-word (surname) matches, then small typos in longer names. Matching is only ever
+ * against the two official names for that match, and a pick that fits both is flagged, never guessed.
  */
 
 const APOSTROPHES = /[‘’ʼ`´]/g; // ‘ ’ ʼ ` ´ → '
@@ -49,24 +48,61 @@ export function looseKey(raw: string | null | undefined): string {
     .trim();
 }
 
-export type NameMatch = 'exact' | 'probable' | 'different';
+// ─── Matching a member's typed pick to an official name ───────
+
+export type PickMatch = 'exact' | 'close' | 'none';
+
+/** Optimal-string-alignment distance (insertions, deletions, substitutions, adjacent swaps). */
+function editDistance(a: string, b: string): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/** Typos allowed in one word: none for short names (Saka, Rice), 1 from 5 letters, 2 from 9. */
+function tokensClose(a: string, b: string): boolean {
+  if (a === b) return true;
+  const len = Math.min(a.length, b.length);
+  const allowed = len >= 9 ? 2 : len >= 5 ? 1 : 0;
+  return allowed > 0 && editDistance(a, b) <= allowed;
+}
+
+/** Every word of `small` matches (exactly, or within typo tolerance) a different word of `big`. */
+function wordsContained(small: string[], big: string[], fuzzy: boolean): boolean {
+  const used = new Set<number>();
+  return small.every((w) => {
+    const i = big.findIndex((b, idx) => !used.has(idx) && (fuzzy ? tokensClose(w, b) : w === b));
+    if (i < 0) return false;
+    used.add(i);
+    return true;
+  });
+}
 
 /**
- * exact     → same player for scoring.
- * probable  → looks like the same player but isn't an exact match (accents, punctuation, or a single name that
- *             appears in the other full name): needs an admin decision, never scored automatically.
- * different → not the same player.
+ * How a member's typed pick relates to one official name.
+ *  exact → same after normalisation ("bukayo saka" v "Bukayo Saka").
+ *  close → accent/punctuation-insensitive equality ("Odegaard" v "Ødegaard"), whole-word match either way
+ *          ("Saka" v "Bukayo Saka"), or a small typo in a longer word ("Havetz" v "Kai Havertz").
+ *  none  → anything else.
  */
-export function compareNames(a: string | null | undefined, b: string | null | undefined): NameMatch {
-  const ka = nameKey(a);
-  const kb = nameKey(b);
-  if (!ka || !kb) return 'different';
-  if (ka === kb) return 'exact';
-  const la = looseKey(a);
-  const lb = looseKey(b);
-  if (la === lb) return 'probable';
-  const ta = la.split(' ');
-  const tb = lb.split(' ');
-  if ((ta.length === 1 && tb.includes(ta[0])) || (tb.length === 1 && ta.includes(tb[0]))) return 'probable';
-  return 'different';
+export function matchPickToOfficial(pick: string | null | undefined, official: string | null | undefined): PickMatch {
+  const kp = nameKey(pick);
+  const ko = nameKey(official);
+  if (!kp || !ko) return 'none';
+  if (kp === ko) return 'exact';
+  const lp = looseKey(pick);
+  const lo = looseKey(official);
+  if (lp === lo) return 'close';
+  const tp = lp.split(' ').filter(Boolean);
+  const to = lo.split(' ').filter(Boolean);
+  if (wordsContained(tp, to, false) || wordsContained(to, tp, false)) return 'close';
+  if (wordsContained(tp, to, true) || wordsContained(to, tp, true)) return 'close';
+  return 'none';
 }
