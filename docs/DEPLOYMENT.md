@@ -50,8 +50,8 @@ Changing an environment variable needs a redeploy (Deployments → ⋯ → Redep
 | Variable | Production | Preview | Notes |
 |---|---|---|---|
 | `APP_ENV` | `production` | `preview` | |
-| `DATABASE_URL` | prod **session** pooler (5432) | preview DB | Server only. The transaction pooler (6543) caused hung/empty queries in production, so use the session pooler |
-| `DB_POOL_MAX` | `3` | `2` | Connections per server instance (keeps within Supabase's session-pooler limit) |
+| `DATABASE_URL` | prod **transaction** pooler (6543) | preview DB | Server only. Don't use the session pooler here: it allows only ~15 clients and runs out on Vercel |
+| `DB_POOL_MAX` | `3` | `3` | Connections per server instance |
 | `DIRECT_URL` | prod session pooler (5432) | preview DB | Used for migrations at build time |
 | `PIN_PEPPER` | random 64 hex | different random 64 hex | `openssl rand -hex 32`. **Never change in production**: it invalidates every PIN |
 | `ADMIN_SETUP_TOKEN` | random, then delete after setup | random | |

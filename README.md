@@ -19,7 +19,7 @@ A private prediction league for 32 Arsenal fans. Members log in with their name 
 ## Stack
 
 - **Next.js 16** (App Router, server actions) + React 19 + TypeScript, deployed on **Vercel**
-- **PostgreSQL** on **Supabase** (any Postgres works), accessed with [`postgres`](https://github.com/porsager/postgres) (postgres.js): one small dependency, plain SQL, works with Supabase's pooler. No ORM: the schema is small and the SQL is the clearest record of the rules.
+- **PostgreSQL** on **Supabase** (any Postgres works), accessed with [`pg`](https://node-postgres.com) (node-postgres) through a small tagged-template helper in `src/lib/db.ts`: plain SQL, one query at a time per connection, which is what Supabase's transaction pooler needs. No ORM: the schema is small and the SQL is the clearest record of the rules.
 - Plain SQL migrations in `db/migrations`, applied by `scripts/migrate.ts`
 - Tests use Node's built-in test runner (`node:test`) via `tsx`: no test framework dependency
 - Self-hosted fonts (Barlow / Barlow Condensed via Fontsource)
