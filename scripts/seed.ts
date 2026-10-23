@@ -6,20 +6,17 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import postgres from 'postgres';
-
-const url = process.env.DIRECT_URL || process.env.DATABASE_URL;
-if (!url && process.argv.includes('--if-configured')) {
-  console.log('[seed] No DIRECT_URL/DATABASE_URL set: skipping.');
-  process.exit(0);
-}
-if (!url) {
-  console.error('[seed] Set DIRECT_URL (or DATABASE_URL).');
-  process.exit(1);
-}
+import { connectForScript } from './db-connect';
 
 async function main() {
-  const sql = postgres(url!, { prepare: false, max: 1, onnotice: () => {} });
+  const sql = await connectForScript('seed');
+  if (!sql) {
+    if (process.argv.includes('--if-configured')) {
+      console.log('[seed] No DIRECT_URL/DATABASE_URL set: skipping.');
+      return;
+    }
+    throw new Error('Set DIRECT_URL (or DATABASE_URL).');
+  }
   try {
     await sql.begin((tx) => tx.unsafe(readFileSync(join(process.cwd(), 'db', 'seed.sql'), 'utf8')));
     const [s] = await sql<{ members: number; admins: number; opening: number }[]>`
