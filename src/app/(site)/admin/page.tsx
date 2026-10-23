@@ -28,6 +28,7 @@ export default async function AdminHome() {
     recentRuns(12),
   ]);
   const okBy = new Map(okRuns.map((r) => [r.job, r.finishedAt]));
+  const withoutPin = noPin[0]?.n ?? 0;
 
   return (
     <div className="stack">
@@ -35,7 +36,7 @@ export default async function AdminHome() {
 
       <section className="panel">
         <h2>Needs attention</h2>
-        {attention.length === 0 && discrepancies.length === 0 && locked.length === 0 && noPin[0].n === 0 ? (
+        {attention.length === 0 && discrepancies.length === 0 && locked.length === 0 && withoutPin === 0 ? (
           <p className="muted">Nothing waiting. All finished matches are scored.</p>
         ) : (
           <ul className="fixture-list">
@@ -57,8 +58,8 @@ export default async function AdminHome() {
             {locked.length > 0 && (
               <li><div><Link className="opp" href="/admin/members">Locked out</Link><div className="meta">{locked.map((l) => l.displayName).join(', ')} hit too many wrong PINs.</div></div></li>
             )}
-            {noPin[0].n > 0 && (
-              <li><div><Link className="opp" href="/admin/members">{noPin[0].n} member(s) without a PIN</Link><div className="meta">They can&rsquo;t log in until you issue one.</div></div></li>
+            {withoutPin > 0 && (
+              <li><div><Link className="opp" href="/admin/members">{withoutPin} member(s) without a PIN</Link><div className="meta">They can&rsquo;t log in until you issue one.</div></div></li>
             )}
           </ul>
         )}

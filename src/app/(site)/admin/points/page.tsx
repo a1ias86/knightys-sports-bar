@@ -38,9 +38,9 @@ export default async function PointsAdmin() {
         </section>
         <section className="panel">
           <h2>Checks</h2>
-          {check[0].bad === 0
+          {(check[0]?.bad ?? 0) === 0
             ? <p>Every member&rsquo;s total equals opening balance + match points + adjustments.</p>
-            : <div className="alert alert-error">{check[0].bad} member total(s) don&rsquo;t reconcile. Export a backup and investigate.</div>}
+            : <div className="alert alert-error">{check[0]?.bad} member total(s) don&rsquo;t reconcile. Export a backup and investigate.</div>}
           <div className="stat-strip" style={{ margin: '12px 0 20px' }}>
             <div><b className="num">{sum('openingPoints')}</b><span>opening</span></div>
             <div><b className="num">{sum('matchPoints')}</b><span>from matches</span></div>
