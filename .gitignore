@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# next.js / build
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# env files: never commit real secrets
+.env
+.env.*
+!.env.example
+
+# vercel
+.vercel/
+
+# exports & local data (may contain competition data)
+exports/
+*.backup.json
+*.dump
+*.sql.gz
+
+# logs / os
+npm-debug.log*
+.DS_Store
+coverage/

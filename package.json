@@ -1,0 +1,43 @@
+{
+  "name": "knightys-sports-bar",
+  "version": "1.0.0-beta",
+  "private": true,
+  "description": "Knighty's Sports Bar: Arsenal Men's Prediction League",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/unit/*.test.ts",
+    "test:db": "tsx --test --test-concurrency=1 tests/db/*.test.ts",
+    "test:all": "npm run test && npm run test:db",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "db:setup": "tsx scripts/migrate.ts && tsx scripts/seed.ts",
+    "admin:setup": "tsx scripts/admin-setup.ts",
+    "export": "tsx scripts/export.ts",
+    "vercel-build": "tsx scripts/migrate.ts --if-configured && next build"
+  },
+  "dependencies": {
+    "@fontsource/barlow": "^5.3.0",
+    "@fontsource/barlow-condensed": "^5.3.0",
+    "next": "16.4.2",
+    "postgres": "3.4.9",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "^9.39.0",
+    "eslint-config-next": "16.4.2",
+    "tsx": "^4.23.15",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,231 @@
+import Link from 'next/link';
+import { notFound } from 'next/navigation';
+import { requireAdmin } from '@/lib/session';
+import { getFixture, listCompetitions, playersForFixture, displayStatus, type FixturePlayer } from '@/lib/fixtures';
+import { predictionsForFixture } from '@/lib/predictions';
+import { getResult, getFeed, fixtureScores, matchEvents } from '@/lib/results';
+import { sql } from '@/lib/db';
+import { formatKickoff, formatDateTime, ukZoneLabel } from '@/lib/time';
+import { StatusChip, SourceChip, venueText, Alert } from '@/components/bits';
+import { ActionForm } from '@/components/ActionForm';
+import { FixtureFields } from '@/components/FixtureFields';
+import {
+  updateFixtureAction, fixtureSyncToggleAction, manualResultAction, verifyResultAction, voidPlayerCategoriesAction,
+  reopenAction, recalcFixtureAction, overridePredictionAction,
+} from '../../actions';
+
+export const metadata = { title: 'Manage fixture' };
+
+function PlayerOptions({ players, noneLabel }: { players: FixturePlayer[]; noneLabel: string }) {
+  return (
+    <>
+      <option value="none">{noneLabel}</option>
+      <optgroup label="Arsenal">{players.filter((p) => p.isArsenal).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</optgroup>
+      <optgroup label="Opponent">{players.filter((p) => !p.isArsenal).map((p) => <option key={p.id} value={p.id}>{p.name} ({p.teamName})</option>)}</optgroup>
+    </>
+  );
+}
+
+export default async function FixtureAdmin({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ created?: string }> }) {
+  await requireAdmin();
+  const { id } = await params;
+  const { created } = await searchParams;
+  const fixture = await getFixture(id);
+  if (!fixture) notFound();
+  const [competitions, players, preds, result, feed, scores, events, members] = await Promise.all([
+    listCompetitions(),
+    playersForFixture(fixture),
+    predictionsForFixture(id),
+    getResult(id),
+    getFeed(id),
+    fixtureScores(id),
+    matchEvents(id),
+    sql<{ id: string; displayName: string }[]>`select id, display_name from members where is_active order by lower(display_name)`,
+  ]);
+  const scoreBy = new Map(scores.map((s) => [s.memberId, s]));
+  const finalised = fixture.scoringStatus === 'finalised';
+  const status = displayStatus(fixture, false);
+  const r = result;
+
+  return (
+    <div className="stack">
+      <p className="muted" style={{ marginBottom: 0 }}><Link href="/admin/fixtures">All fixtures</Link> · <Link href={`/matches/${id}`}>Member view</Link></p>
+      <div>
+        <h1>{venueText(fixture.venue, fixture.opponent)}</h1>
+        <div className="row">
+          <StatusChip status={status} />
+          <span className="muted">{fixture.competitionName} · {formatKickoff(fixture.kickoffAt)} {ukZoneLabel(fixture.kickoffAt)} · scoring: {fixture.scoringStatus.replace(/_/g, ' ')}</span>
+        </div>
+      </div>
+      {created && <Alert kind="ok">Fixture added. Members can predict until kick-off.</Alert>}
+      {fixture.reviewReason && !finalised && <Alert kind="warn">{fixture.reviewReason}</Alert>}
+      {feed?.discrepancy && <Alert kind="warn">Feed discrepancy: {feed.discrepancy} Your entered result has been kept. Correct it below if the feed is right, or press Verify to confirm yours.</Alert>}
+
+      <div className="grid-2">
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Result</h2>
+            {r && <SourceChip source={r.source} verified={r.verified} />}
+          </div>
+          {!r ? (
+            <p className="muted">No result yet. {fixture.provider ? 'The feed will add it after full time, or enter it below.' : 'Enter it below after the match.'}</p>
+          ) : (
+            <>
+              <dl className="confirm-list">
+                <dt>Score</dt><dd>Arsenal {r.arsenalGoals}–{r.opponentGoals} {fixture.opponent}</dd>
+                <dt>First goalscorer</dt><dd>{r.firstScorerKind === 'player' ? r.firstScorerName : r.firstScorerKind === 'none' ? 'None (no qualifying goal)' : <span className="chip chip-awaiting">Unknown</span>}</dd>
+                <dt>First assister</dt><dd>{r.firstAssisterKind === 'player' ? r.firstAssisterName : r.firstAssisterKind === 'none' ? 'None' : <span className="chip chip-awaiting">Unknown</span>}</dd>
+                <dt>Own goal first</dt><dd>{r.firstGoalOwnGoal ? 'Yes' : 'No'}</dd>
+                {r.verified && <><dt>Verified</dt><dd>{r.verifiedByName ?? 'admin'}, {r.verifiedAt ? formatDateTime(r.verifiedAt) : ''}</dd></>}
+                {r.playerCategoriesVoid && <><dt>Ruling</dt><dd>Scorer/assist not scored: {r.voidReason}</dd></>}
+                {r.notesPrivate && <><dt>Admin notes</dt><dd>{r.notesPrivate}</dd></>}
+              </dl>
+              {r.issues.length > 0 && <Alert kind="warn">{r.issues.join(' ')}</Alert>}
+            </>
+          )}
+          {feed && (
+            <p className="small muted">Feed ({feed.provider}) last checked {formatDateTime(feed.fetchedAt)}: {feed.arsenalGoals ?? '?'}–{feed.opponentGoals ?? '?'}, {feed.status}.</p>
+          )}
+          <div className="row" style={{ marginTop: 12 }}>
+            {r && !finalised && fixture.status === 'finished' && (
+              <ActionForm action={verifyResultAction} submitLabel="Verify and score" submitClass="btn btn-red btn-small" confirm="Confirm this result is correct and publish the points?">
+                <input type="hidden" name="fixtureId" value={id} />
+              </ActionForm>
+            )}
+            {finalised && (
+              <ActionForm action={recalcFixtureAction} submitLabel="Recalculate" submitClass="btn btn-ghost btn-small">
+                <input type="hidden" name="fixtureId" value={id} />
+              </ActionForm>
+            )}
+          </div>
+          {finalised && (
+            <details className="inline" style={{ marginTop: 16 }}>
+              <summary>Withdraw points to correct this match</summary>
+              <ActionForm action={reopenAction} submitLabel="Reopen scoring" submitClass="btn btn-danger btn-small" confirm="Withdraw this match's points from the table until it is finalised again?">
+                <input type="hidden" name="fixtureId" value={id} />
+                <div className="field"><label htmlFor="reopen-reason">Reason</label><input id="reopen-reason" name="reason" type="text" required minLength={5} /></div>
+              </ActionForm>
+            </details>
+          )}
+          {r && !finalised && fixture.status === 'finished' && (
+            <details className="inline" style={{ marginTop: 16 }}>
+              <summary>No reliable scorer/assist data anywhere?</summary>
+              <p className="small muted">Competition ruling: finalise with goalscorer and assister picks scoring 0 for everyone. Result and total goals still count. Recorded in the audit log and shown to members.</p>
+              <ActionForm action={voidPlayerCategoriesAction} submitLabel="Finalise without player picks" submitClass="btn btn-danger btn-small" confirm="Finalise this match without scoring goalscorer/assist picks?">
+                <input type="hidden" name="fixtureId" value={id} />
+                <div className="field"><label htmlFor="void-reason">Reason (shown to members)</label><input id="void-reason" name="reason" type="text" required minLength={10} /></div>
+              </ActionForm>
+            </details>
+          )}
+          {events.length > 0 && (
+            <details className="inline" style={{ marginTop: 16 }}>
+              <summary>Feed events ({events.length})</summary>
+              <ol className="small">
+                {events.map((e, i) => (
+                  <li key={i}>{e.minute ?? '?'}′ {e.eventType.replace('_', ' ')} · {e.side} · {e.playerName ?? 'unknown'}{e.eventType === 'substitution' ? ` on for ${e.assistName}` : e.assistStatus === 'credited' ? ` · assist ${e.assistName}` : ` · assist ${e.assistStatus}`}</li>
+                ))}
+              </ol>
+            </details>
+          )}
+        </section>
+
+        <section className="panel">
+          <h2>{r ? 'Correct the result' : 'Enter the result'}</h2>
+          <p className="small muted">Uses the same scoring as automatic results. Your entry is treated as verified and won&rsquo;t be overwritten by the feed.</p>
+          <ActionForm action={manualResultAction} submitLabel="Publish result" submitClass="btn btn-red">
+            <input type="hidden" name="fixtureId" value={id} />
+            <div className="score-entry" style={{ marginBottom: 16 }}>
+              <div><label htmlFor="mr-ag">Arsenal</label><input id="mr-ag" name="arsenalGoals" type="number" min={0} max={20} required defaultValue={r?.arsenalGoals} /></div>
+              <span className="sb-dash" aria-hidden>–</span>
+              <div><label htmlFor="mr-og">{fixture.opponent}</label><input id="mr-og" name="opponentGoals" type="number" min={0} max={20} required defaultValue={r?.opponentGoals} /></div>
+            </div>
+            <div className="field">
+              <label htmlFor="mr-scorer">First goalscorer (first non-own-goal)</label>
+              <select id="mr-scorer" name="firstScorer" defaultValue={r?.firstScorerPlayerId ?? 'none'}>
+                <PlayerOptions players={players} noneLabel="None: 0–0, or only own goals" />
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="mr-assister">First credited assister (any qualifying goal, in order)</label>
+              <select id="mr-assister" name="firstAssister" defaultValue={r?.firstAssisterPlayerId ?? 'none'}>
+                <PlayerOptions players={players} noneLabel="None: no assisted goal" />
+              </select>
+            </div>
+            <div className="field"><label className="checkbox"><input type="checkbox" name="ownGoal" defaultChecked={r?.firstGoalOwnGoal} /> The first goal of the match was an own goal</label></div>
+            <div className="field"><label className="checkbox"><input type="checkbox" name="unassisted" defaultChecked={r?.firstGoalUnassisted} /> The first qualifying goal was unassisted</label></div>
+            <div className="field">
+              <label htmlFor="mr-status">Match status</label>
+              <select id="mr-status" name="status" defaultValue={fixture.status === 'abandoned' ? 'abandoned' : 'finished'}>
+                <option value="finished">Finished: score the predictions</option>
+                <option value="live">Live: save the score so far, don&rsquo;t score</option>
+                <option value="abandoned">Abandoned: no points</option>
+              </select>
+            </div>
+            <div className="field"><label htmlFor="mr-public">Note for members (optional)</label><input id="mr-public" name="publicNote" type="text" maxLength={500} defaultValue={r?.publicNote ?? ''} /></div>
+            <div className="field"><label htmlFor="mr-private">Admin-only notes (optional)</label><textarea id="mr-private" name="notesPrivate" maxLength={2000} defaultValue={r?.notesPrivate ?? ''} /></div>
+            <div className="field"><label className="checkbox"><input type="checkbox" name="confirm" value="yes" required /> I&rsquo;ve checked this and want to publish it</label></div>
+          </ActionForm>
+          {players.length === 0 && <p className="small muted">No players loaded for this match. Add them in <Link href="/admin/players">Players</Link>.</p>}
+        </section>
+      </div>
+
+      <section className="panel">
+        <div className="panel-head"><h2>Predictions ({preds.length})</h2><span className="small muted">Admins can always see these. Members see them after kick-off.</span></div>
+        {preds.length === 0 ? <p className="muted">No predictions yet.</p> : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Member</th><th className="c">Score</th><th>Scorer</th><th>Assister</th><th>Saved</th>{finalised && <><th className="r">Breakdown</th><th className="r">Total</th></>}</tr></thead>
+              <tbody>
+                {preds.map((p) => {
+                  const s = scoreBy.get(p.memberId);
+                  return (
+                    <tr key={p.memberId}>
+                      <td><strong>{p.displayName}</strong>{p.overrideReason && <div className="small" style={{ color: 'var(--warn)' }}>Set by admin: {p.overrideReason}</div>}</td>
+                      <td className="c num">{p.arsenalGoals}–{p.opponentGoals}</td>
+                      <td>{p.scorerNone ? 'None' : p.scorerName}</td>
+                      <td>{p.assisterNone ? 'None' : p.assisterName}</td>
+                      <td className="small muted">{formatDateTime(p.updatedAt)}</td>
+                      {finalised && <><td className="r small num">{s ? `${s.scorerPoints}/${s.assisterPoints}/${s.resultPoints}/${s.totalGoalsPoints}/+${s.bonusPoints}` : '–'}</td><td className="r points-cell">{s?.totalPoints ?? 0}</td></>}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {finalised && <p className="small muted">Breakdown: scorer / assister / result / total goals / bonus.</p>}
+        <details className="inline" style={{ marginTop: 16 }}>
+          <summary>Set a prediction for a member (admin override)</summary>
+          <p className="small muted">Only for genuine cases, e.g. a member sent their prediction before kick-off but couldn&rsquo;t log in. The reason is recorded in the audit log. If the match is already scored it is rescored.</p>
+          <ActionForm action={overridePredictionAction} submitLabel="Save override" submitClass="btn btn-small" confirm="Save this prediction on the member's behalf?">
+            <input type="hidden" name="fixtureId" value={id} />
+            <div className="form-grid">
+              <div className="field"><label htmlFor="ov-member">Member</label><select id="ov-member" name="memberId" required>{members.map((m) => <option key={m.id} value={m.id}>{m.displayName}</option>)}</select></div>
+              <div className="field"><label htmlFor="ov-ag">Arsenal</label><input id="ov-ag" name="arsenalGoals" type="number" min={0} max={20} required /></div>
+              <div className="field"><label htmlFor="ov-og">{fixture.opponent}</label><input id="ov-og" name="opponentGoals" type="number" min={0} max={20} required /></div>
+              <div className="field"><label htmlFor="ov-scorer">First goalscorer</label><select id="ov-scorer" name="scorer"><PlayerOptions players={players} noneLabel="No goalscorer (0–0 only)" /></select></div>
+              <div className="field"><label htmlFor="ov-assister">First assister</label><select id="ov-assister" name="assister"><PlayerOptions players={players} noneLabel="No assister" /></select></div>
+              <div className="field"><label htmlFor="ov-reason">Reason</label><input id="ov-reason" name="reason" type="text" required minLength={5} /></div>
+            </div>
+          </ActionForm>
+        </details>
+      </section>
+
+      <section className="panel">
+        <h2>Fixture details</h2>
+        {fixture.provider && (
+          <form action={fixtureSyncToggleAction} className="row" style={{ marginBottom: 16 }}>
+            <input type="hidden" name="fixtureId" value={id} />
+            <input type="hidden" name="allow" value={fixture.manualOverride ? '1' : '0'} />
+            <span className="small muted">{fixture.manualOverride ? 'Locked: the feed won’t change kick-off time or status.' : `Synced from ${fixture.provider}${fixture.lastSyncedAt ? `, last ${formatDateTime(fixture.lastSyncedAt)}` : ''}.`}</span>
+            <button className="btn btn-ghost btn-small">{fixture.manualOverride ? 'Let the feed update it' : 'Lock from feed changes'}</button>
+          </form>
+        )}
+        <ActionForm action={updateFixtureAction} submitLabel="Save fixture" submitClass="btn" confirm="Save these fixture details? Changing kick-off moves the prediction deadline.">
+          <input type="hidden" name="fixtureId" value={id} />
+          <FixtureFields competitions={competitions} fixture={fixture} />
+        </ActionForm>
+      </section>
+    </div>
+  );
+}
