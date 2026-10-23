@@ -23,15 +23,7 @@ For each, from **Project Settings → Database → Connection string**:
 - **Transaction pooler** URI (port 6543) → `DATABASE_URL`
 - **Session pooler** URI (port 5432) → `DIRECT_URL`
 
-Then, from your computer with the repository cloned:
-
-```bash
-npm install
-DIRECT_URL="<prod session pooler URI>" npm run db:setup
-DIRECT_URL="<preview session pooler URI>" npm run db:setup
-```
-
-(After this, the Vercel build applies new migrations automatically; see §6.)
+You don't need to run anything locally: every Vercel build applies pending migrations and the (re-run-safe) seed to the database configured for that environment. To do it by hand instead: `DIRECT_URL="<session pooler URI>" npm run db:setup`.
 
 ## 3. GitHub
 
@@ -73,7 +65,7 @@ Preview deployments point at the preview database, so testing never touches live
 ## 6. Migrations
 
 - Schema changes are new files in `db/migrations/` (`0002_...sql`). Never edit an applied migration.
-- The Vercel build runs `tsx scripts/migrate.ts --if-configured && next build`, so a deployment applies pending migrations to *its* database (preview → preview DB, production → production DB) before building. If a migration fails, the build fails and the previous deployment keeps serving.
+- The Vercel build runs `migrate.ts --if-configured`, then `seed.ts --if-configured` (never overwrites existing data), then `next build`, so a deployment applies pending migrations to *its* database (preview → preview DB, production → production DB) before building. If a migration fails, the build fails and the previous deployment keeps serving.
 - The runner refuses `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM` unless the file is named `*.destructive.sql` **and** `ALLOW_DESTRUCTIVE_MIGRATIONS=1` is set for that one run. Take a backup first and run those by hand.
 
 ## 7. Scheduled jobs

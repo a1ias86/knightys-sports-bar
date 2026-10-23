@@ -2,12 +2,17 @@
  * Loads the 32 initial members, opening balances, competitions and default settings.
  * Safe to re-run: never duplicates members, resets PINs or overwrites opening balances.
  * Usage: npm run db:seed
+ *        tsx scripts/seed.ts --if-configured   (used by the Vercel build; skips if no DB URL set)
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import postgres from 'postgres';
 
 const url = process.env.DIRECT_URL || process.env.DATABASE_URL;
+if (!url && process.argv.includes('--if-configured')) {
+  console.log('[seed] No DIRECT_URL/DATABASE_URL set: skipping.');
+  process.exit(0);
+}
 if (!url) {
   console.error('[seed] Set DIRECT_URL (or DATABASE_URL).');
   process.exit(1);
