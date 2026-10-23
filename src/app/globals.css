@@ -341,3 +341,18 @@ details.inline[open] summary { margin-bottom: 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ─── Admin: official result entry & scoring table ─ */
+.official-field { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px 4px; margin: 0 0 16px; }
+.official-field legend { font-weight: 600; color: var(--chalk-dim); padding: 0 6px; }
+.official-field .checkbox { margin-bottom: 10px; }
+.official-named { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; margin-bottom: 10px; }
+.official-named .checkbox { margin: 0; white-space: nowrap; }
+@media (max-width: 520px) { .official-named { grid-template-columns: 1fr; } }
+.verdict { display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 1px 7px; border-radius: 999px; margin-left: 4px; vertical-align: 1px; }
+.v-correct { background: rgba(63, 182, 123, 0.16); color: var(--ok); }
+.v-cross { background: rgba(224, 164, 58, 0.16); color: var(--warn); }
+.v-wrong { background: rgba(219, 0, 7, 0.14); color: #ff9a9a; }
+.v-review { background: var(--warn); color: #1a1205; }
+.v-pending { background: var(--stand-2); color: var(--muted); }
+.scoring-table .official-row td { background: var(--gold-soft); border-bottom: 1px solid var(--gold); }

@@ -42,8 +42,15 @@ async function makePlayer(name: string, team: string) {
 async function kickoffNow(fixtureId: string, status = 'finished') {
   await sql`update fixtures set kickoff_at = now() - interval '2 hours', status = ${status} where id = ${fixtureId}`;
 }
+/** scorer/assister: a typed name, or 'none' (confirmed none), 'unknown', 'pending'. */
 function manual(ag: number, og: number, scorer: string, assister: string, extra: Partial<ManualResultForm> = {}): ManualResultForm {
-  return { arsenalGoals: ag, opponentGoals: og, firstScorer: scorer, firstAssister: assister, firstGoalOwnGoal: false, firstGoalUnassisted: false, status: 'finished', notesPrivate: '', publicNote: '', ...extra };
+  const st = (v: string) => (['none', 'unknown', 'pending'].includes(v) ? (v as 'none' | 'unknown' | 'pending') : 'named' as const);
+  return {
+    arsenalGoals: ag, opponentGoals: og,
+    scorerState: st(scorer), scorerName: st(scorer) === 'named' ? scorer : '',
+    assisterState: st(assister), assisterName: st(assister) === 'named' ? assister : '',
+    firstGoalOwnGoal: false, firstGoalUnassisted: false, status: 'finished', notesPrivate: '', publicNote: '', ...extra,
+  };
 }
 
 before(async () => {
@@ -262,7 +269,7 @@ describe('Scoring persistence', () => {
     await kickoffNow(ids.chelsea, 'live');
     const antBefore = (await total('Ant')).totalPoints; // 17
     const steffBefore = (await total('Steff')).totalPoints; // 48
-    const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, players.Saka, players.Rice));
+    const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, 'Saka', 'Rice'));
     assert.ok(r.ok && r.finalise?.status === 'finalised');
     // Ant: 1-0, Saka, Rice -> 15 (full house)
     assert.equal((await total('Ant')).totalPoints, antBefore + 15);
@@ -293,7 +300,7 @@ describe('Scoring persistence', () => {
   });
 
   test('correcting the scorer recalculates (replaces, not adds)', async () => {
-    const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, players.Rice, players.Saka));
+    const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, 'Rice', 'Saka'));
     assert.ok(r.ok);
     // Ant picked Saka (scorer) / Rice (assister): both crossovers now -> 3+3+1+1 = 8
     assert.equal((await total('Ant')).matchPoints, 8);
@@ -309,7 +316,7 @@ describe('Scoring persistence', () => {
   });
 
   test('a manual result with an invalid outcome is rejected', async () => {
-    const r = await saveManualResult(jon, ids.chelsea, manual(0, 0, players.Saka, 'none'));
+    const r = await saveManualResult(jon, ids.chelsea, manual(0, 0, 'Saka', 'none'));
     assert.equal(r.ok, false);
   });
 });
@@ -411,7 +418,7 @@ describe('Automatic feed processing', () => {
 
   test('admin-verified manual result is never overwritten by a conflicting feed', async () => {
     const id = await feedFixture('Fulham');
-    await saveManualResult(jon, id, manual(2, 1, players.Saka, players.Odegaard));
+    await saveManualResult(jon, id, manual(2, 1, 'Saka', 'Odegaard'));
     const before = (await total('Mark D')).matchPoints;
     const msg = await applyFeedMatch(id, 'test', {
       status: 'finished', arsenalGoals: 3, opponentGoals: 1,

@@ -43,7 +43,7 @@ Then open `/setup`, enter your `ADMIN_SETUP_TOKEN`, and note the PINs shown for 
 |---|---|
 | `npm run dev` / `build` / `start` | Next.js |
 | `npm run lint` / `typecheck` | ESLint / TypeScript |
-| `npm test` | Unit tests: scoring rules, UK time handling, provider parsing |
+| `npm test` | Unit tests: scoring rules, name matching, result-form validation, UK time handling, provider parsing |
 | `npm run test:db` | Database tests (needs `TEST_DATABASE_URL` pointing at a throwaway DB whose name contains "test"; it is wiped) |
 | `npm run db:migrate` | Apply new migrations (refuses destructive SQL unless explicitly allowed) |
 | `npm run db:seed` | Load members/opening balances (never overwrites existing data) |

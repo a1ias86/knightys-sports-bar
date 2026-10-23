@@ -5,22 +5,26 @@ import {
   scorePrediction, isScoreable, validateOutcome, deriveOutcome,
   type MatchOutcome, type FirstPlayer, type GoalEvent, type Pick as PlayerPick,
 } from './scoring';
+import { cleanName, nameKey, validateName, compareNames } from './names';
+
+export type FirstKind = 'player' | 'none' | 'unknown' | 'pending';
 
 export interface StoredResult {
   fixtureId: string;
   arsenalGoals: number;
   opponentGoals: number;
   source: 'automatic' | 'manual';
-  firstScorerKind: 'player' | 'none' | 'unknown';
+  firstScorerKind: FirstKind;
   firstScorerPlayerId: string | null;
   firstScorerName: string | null;
-  firstAssisterKind: 'player' | 'none' | 'unknown';
+  firstAssisterKind: FirstKind;
   firstAssisterPlayerId: string | null;
   firstAssisterName: string | null;
   firstGoalOwnGoal: boolean;
   firstGoalUnassisted: boolean;
   playerCategoriesVoid: boolean;
   voidReason: string | null;
+  nameReviewConfirmed: boolean;
   issues: string[];
   verified: boolean;
   verifiedAt: Date | null;
@@ -30,12 +34,19 @@ export interface StoredResult {
   updatedAt: Date;
 }
 
+export const KIND_LABEL: Record<FirstKind, { scorer: string; assister: string }> = {
+  player: { scorer: 'Named player', assister: 'Named player' },
+  none: { scorer: 'No qualifying goal', assister: 'Confirmed: no credited assist' },
+  unknown: { scorer: 'Unknown (not available)', assister: 'Unknown (not available)' },
+  pending: { scorer: 'Not entered yet', assister: 'Not entered yet' },
+};
+
 export async function getResult(fixtureId: string, db: Db = sql): Promise<StoredResult | null> {
   const rows = await db<StoredResult[]>`
     select r.fixture_id, r.arsenal_goals, r.opponent_goals, r.source,
-      r.first_scorer_kind, r.first_scorer_player_id, sp.name as first_scorer_name,
-      r.first_assister_kind, r.first_assister_player_id, ap.name as first_assister_name,
-      r.first_goal_own_goal, r.first_goal_unassisted, r.player_categories_void, r.void_reason, r.issues,
+      r.first_scorer_kind, r.first_scorer_player_id, coalesce(r.first_scorer_name, sp.name) as first_scorer_name,
+      r.first_assister_kind, r.first_assister_player_id, coalesce(r.first_assister_name, ap.name) as first_assister_name,
+      r.first_goal_own_goal, r.first_goal_unassisted, r.player_categories_void, r.void_reason, r.name_review_confirmed, r.issues,
       r.verified, r.verified_at, vm.display_name as verified_by_name, r.notes_private, r.public_note, r.updated_at
     from match_results r
     left join players sp on sp.id = r.first_scorer_player_id
@@ -45,18 +56,19 @@ export async function getResult(fixtureId: string, db: Db = sql): Promise<Stored
   return rows[0] ?? null;
 }
 
-function toFirst(kind: string, id: string | null): FirstPlayer {
-  if (kind === 'player' && id) return { kind: 'player', id };
+/** Official result → scoring outcome. Players are identified by their normalised NAME (nameKey). */
+function toFirst(kind: FirstKind, name: string | null): FirstPlayer {
+  if (kind === 'player' && nameKey(name)) return { kind: 'player', id: nameKey(name) };
   if (kind === 'none') return { kind: 'none' };
-  return { kind: 'unknown' };
+  return { kind: 'unknown' }; // 'unknown' and 'pending' are never scored
 }
 
-export function outcomeFromResult(r: Pick<StoredResult, 'arsenalGoals' | 'opponentGoals' | 'firstScorerKind' | 'firstScorerPlayerId' | 'firstAssisterKind' | 'firstAssisterPlayerId' | 'firstGoalOwnGoal'>): MatchOutcome {
+export function outcomeFromResult(r: Pick<StoredResult, 'arsenalGoals' | 'opponentGoals' | 'firstScorerKind' | 'firstScorerName' | 'firstAssisterKind' | 'firstAssisterName' | 'firstGoalOwnGoal'>): MatchOutcome {
   return {
     arsenalGoals: r.arsenalGoals,
     opponentGoals: r.opponentGoals,
-    firstScorer: toFirst(r.firstScorerKind, r.firstScorerPlayerId),
-    firstAssister: toFirst(r.firstAssisterKind, r.firstAssisterPlayerId),
+    firstScorer: toFirst(r.firstScorerKind, r.firstScorerName),
+    firstAssister: toFirst(r.firstAssisterKind, r.firstAssisterName),
     firstGoalWasOwnGoal: r.firstGoalOwnGoal,
   };
 }
@@ -64,6 +76,90 @@ export function outcomeFromResult(r: Pick<StoredResult, 'arsenalGoals' | 'oppone
 function outcomeSignature(o: MatchOutcome): string {
   const f = (p: FirstPlayer) => (p.kind === 'player' ? p.id : p.kind);
   return `${o.arsenalGoals}-${o.opponentGoals}|${f(o.firstScorer)}|${f(o.firstAssister)}|${o.firstGoalWasOwnGoal}`;
+}
+
+/** Defence in depth: official results can only be changed by an active admin, whoever calls this code. */
+async function assertAdmin(db: Db, actor: Actor) {
+  const [m] = await db<{ ok: boolean }[]>`select (role = 'admin' and is_active) as ok from members where id = ${actor.id}`;
+  if (!m?.ok) throw new Error('Only an administrator can change official results.');
+}
+
+// ─── Comparing predictions with the official result ──────────
+
+export type PickVerdict =
+  | 'correct'      // exact name match with the official player for this category (5)
+  | 'crossover'    // exact name match with the official player for the OTHER category (3)
+  | 'none-correct' // picked "none" and the official answer is "none" (5)
+  | 'wrong'
+  | 'review'       // near-miss name: needs an admin decision before scoring
+  | 'pending';     // official answer not settled yet
+
+export interface PredictionCheck {
+  predictionId: string;
+  memberId: string;
+  displayName: string;
+  arsenalGoals: number;
+  opponentGoals: number;
+  scorerPick: string | null; // player name, or null for "none"
+  assisterPick: string | null;
+  scorerVerdict: PickVerdict;
+  assisterVerdict: PickVerdict;
+  reviewNotes: string[];
+}
+
+interface Official { kind: FirstKind; name: string | null }
+
+function judgePick(pick: string | null, own: Official, other: Official, voided: boolean): { verdict: PickVerdict; note: string | null } {
+  if (voided) return { verdict: 'wrong', note: null };
+  if (own.kind === 'unknown' || own.kind === 'pending') return { verdict: 'pending', note: null };
+  if (pick === null) return { verdict: own.kind === 'none' ? 'none-correct' : 'wrong', note: null };
+  const vsOwn = own.kind === 'player' ? compareNames(pick, own.name) : 'different';
+  if (vsOwn === 'exact') return { verdict: 'correct', note: null };
+  if (other.kind === 'unknown' || other.kind === 'pending') {
+    if (vsOwn === 'probable') return { verdict: 'review', note: `"${pick}" looks like "${own.name}" but isn't an exact match` };
+    return { verdict: 'pending', note: null };
+  }
+  const vsOther = other.kind === 'player' ? compareNames(pick, other.name) : 'different';
+  if (vsOwn === 'probable') return { verdict: 'review', note: `"${pick}" looks like "${own.name}" but isn't an exact match` };
+  if (vsOther === 'exact') return { verdict: 'crossover', note: null };
+  if (vsOther === 'probable') return { verdict: 'review', note: `"${pick}" looks like "${other.name}" but isn't an exact match` };
+  return { verdict: 'wrong', note: null };
+}
+
+/** Per-member comparison against the current official result. Used for the admin table and the scoring gate. */
+export async function checkPredictions(fixtureId: string, db: Db = sql): Promise<{ result: StoredResult | null; rows: PredictionCheck[] }> {
+  const result = await getResult(fixtureId, db);
+  const preds = await db<{
+    id: string; memberId: string; displayName: string; arsenalGoals: number; opponentGoals: number;
+    scorerName: string | null; scorerNone: boolean; assisterName: string | null; assisterNone: boolean;
+  }[]>`
+    select p.id, p.member_id, m.display_name, p.arsenal_goals, p.opponent_goals,
+           sp.name as scorer_name, p.scorer_none, ap.name as assister_name, p.assister_none
+    from predictions p
+    join members m on m.id = p.member_id
+    left join players sp on sp.id = p.scorer_player_id
+    left join players ap on ap.id = p.assister_player_id
+    where p.fixture_id = ${fixtureId}
+    order by lower(m.display_name)`;
+  const scorer: Official = { kind: result?.firstScorerKind ?? 'pending', name: result?.firstScorerName ?? null };
+  const assister: Official = { kind: result?.firstAssisterKind ?? 'pending', name: result?.firstAssisterName ?? null };
+  const voided = !!result?.playerCategoriesVoid;
+  const reviewed = !!result?.nameReviewConfirmed;
+  const rows = preds.map((p) => {
+    const scorerPick = p.scorerNone ? null : cleanName(p.scorerName);
+    const assisterPick = p.assisterNone ? null : cleanName(p.assisterName);
+    const s = judgePick(scorerPick, scorer, assister, voided);
+    const a = judgePick(assisterPick, assister, scorer, voided);
+    // Once an admin has confirmed the near-misses are different players, they are simply wrong.
+    const fix = (v: PickVerdict): PickVerdict => (v === 'review' && reviewed ? 'wrong' : v);
+    return {
+      predictionId: p.id, memberId: p.memberId, displayName: p.displayName,
+      arsenalGoals: p.arsenalGoals, opponentGoals: p.opponentGoals, scorerPick, assisterPick,
+      scorerVerdict: fix(s.verdict), assisterVerdict: fix(a.verdict),
+      reviewNotes: reviewed ? [] : [s.note, a.note].filter((n): n is string => !!n),
+    };
+  });
+  return { result, rows };
 }
 
 // ─── Scoring a fixture ────────────────────────────────────────
@@ -79,6 +175,9 @@ export type FinaliseResult =
  * deleted and replaced, so running it any number of times gives the same totals (idempotent), and a
  * failure part-way leaves the leaderboard exactly as it was. Opening balances and manual adjustments
  * live in other tables and are never touched.
+ *
+ * Players are matched by normalised name (see names.ts). A near-miss name blocks scoring until an admin
+ * corrects the official name or confirms the names are different players.
  */
 export async function finaliseFixture(
   fixtureId: string,
@@ -88,6 +187,8 @@ export async function finaliseFixture(
 ): Promise<FinaliseResult> {
   return sql.begin((tx) => finaliseInTx(tx, fixtureId, actor, trigger, opts));
 }
+
+const NONE_LABEL = '(none)';
 
 async function finaliseInTx(
   tx: Tx, fixtureId: string, actor: Actor | null, trigger: string, opts: { confirmReview?: boolean },
@@ -118,47 +219,61 @@ async function finaliseInTx(
   if (!playerVoid) {
     const problems = validateOutcome(outcome);
     if (problems.length) return block(problems.join(' '), 'review_required');
-    if (!isScoreable(outcome)) {
-      return block(r.issues.length ? r.issues.join(' ') : 'The first goalscorer or first assister is not known yet.', 'awaiting_verification');
+    const waiting: string[] = [];
+    if (r.firstScorerKind === 'pending') waiting.push('the first goalscorer has not been entered yet');
+    if (r.firstScorerKind === 'unknown') waiting.push('the first goalscorer is marked unknown');
+    if (r.firstAssisterKind === 'pending') waiting.push('the first assister has not been entered yet');
+    if (r.firstAssisterKind === 'unknown') waiting.push('the first assister is marked unknown');
+    if (waiting.length) {
+      const why = `Scoring incomplete: ${waiting.join(' and ')}.` + (r.issues.length ? ` ${r.issues.join(' ')}` : '');
+      return block(why, 'awaiting_verification');
     }
+    if (!isScoreable(outcome)) return block(r.issues.length ? r.issues.join(' ') : 'The result is incomplete.', 'awaiting_verification');
     if (outcome.firstGoalWasOwnGoal && !r.verified && !opts.confirmReview) {
       return block('The first goal was an own goal. An admin must confirm the first qualifying goal before scoring.', 'review_required');
     }
   }
 
-  const preds = await tx<{
-    id: string; memberId: string; arsenalGoals: number; opponentGoals: number;
-    scorerPlayerId: string | null; scorerNone: boolean; assisterPlayerId: string | null; assisterNone: boolean;
-  }[]>`
-    select p.id, p.member_id, p.arsenal_goals, p.opponent_goals, p.scorer_player_id, p.scorer_none,
-           p.assister_player_id, p.assister_none
-    from predictions p where p.fixture_id = ${fixtureId}`;
+  const { rows } = await checkPredictions(fixtureId, tx);
+  const needsReview = rows.filter((x) => x.scorerVerdict === 'review' || x.assisterVerdict === 'review');
+  if (needsReview.length) {
+    const detail = needsReview.flatMap((x) => x.reviewNotes.map((n) => `${x.displayName}: ${n}`)).join('; ');
+    return block(`Player names need checking before scoring. ${detail}. Correct the official name, or confirm they are different players.`, 'review_required');
+  }
 
   const [run] = await tx<{ id: string }[]>`
     insert into scoring_runs (fixture_id, triggered_by, trigger, status, outcome, message)
-    values (${fixtureId}, ${actor?.id ?? null}, ${trigger}, 'success', ${tx.json({ ...outcome, playerCategoriesVoid: playerVoid } as never)},
-            ${`Scored ${preds.length} prediction(s)`})
+    values (${fixtureId}, ${actor?.id ?? null}, ${trigger}, 'success',
+            ${tx.json({ ...outcome, scorerName: r.firstScorerName, assisterName: r.firstAssisterName, playerCategoriesVoid: playerVoid } as never)},
+            ${`Scored ${rows.length} prediction(s)`})
     returning id`;
 
+  const official = (kind: FirstKind, name: string | null) => (playerVoid ? '(void)' : kind === 'player' ? cleanName(name) : NONE_LABEL);
+  const pick = (name: string | null): PlayerPick => (name === null ? { kind: 'none' } : { kind: 'player', id: nameKey(name) });
+
   await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
-  const pick = (id: string | null, none: boolean): PlayerPick => (none || !id ? { kind: 'none' } : { kind: 'player', id });
-  for (const p of preds) {
+  for (const p of rows) {
     const b = scorePrediction(
-      { arsenalGoals: p.arsenalGoals, opponentGoals: p.opponentGoals, scorer: pick(p.scorerPlayerId, p.scorerNone), assister: pick(p.assisterPlayerId, p.assisterNone) },
+      { arsenalGoals: p.arsenalGoals, opponentGoals: p.opponentGoals, scorer: pick(p.scorerPick), assister: pick(p.assisterPick) },
       outcome,
       { playerCategoriesVoid: playerVoid },
     );
     await tx`
       insert into fixture_scores (fixture_id, member_id, prediction_id, scorer_points, scorer_outcome, assister_points,
-        assister_outcome, result_points, total_goals_points, bonus_points, total_points, scoring_run_id)
-      values (${fixtureId}, ${p.memberId}, ${p.id}, ${b.scorerPoints}, ${b.scorerOutcome}, ${b.assisterPoints},
-        ${b.assisterOutcome}, ${b.resultPoints}, ${b.totalGoalsPoints}, ${b.bonusPoints}, ${b.totalPoints}, ${run.id})`;
+        assister_outcome, result_points, total_goals_points, bonus_points, total_points, scoring_run_id,
+        predicted_arsenal_goals, predicted_opponent_goals, predicted_scorer, predicted_assister,
+        official_scorer, official_assister, actual_arsenal_goals, actual_opponent_goals)
+      values (${fixtureId}, ${p.memberId}, ${p.predictionId}, ${b.scorerPoints}, ${b.scorerOutcome}, ${b.assisterPoints},
+        ${b.assisterOutcome}, ${b.resultPoints}, ${b.totalGoalsPoints}, ${b.bonusPoints}, ${b.totalPoints}, ${run.id},
+        ${p.arsenalGoals}, ${p.opponentGoals}, ${p.scorerPick ?? NONE_LABEL}, ${p.assisterPick ?? NONE_LABEL},
+        ${official(r.firstScorerKind, r.firstScorerName)}, ${official(r.firstAssisterKind, r.firstAssisterName)},
+        ${r.arsenalGoals}, ${r.opponentGoals})`;
   }
   await tx`update fixtures set scoring_status = 'finalised', review_reason = null, updated_at = now() where id = ${fixtureId}`;
   await audit(tx, actor, f.scoringStatus === 'finalised' ? 'scoring.recalculated' : 'scoring.finalised', 'fixture', fixtureId, {
-    trigger, predictions: preds.length, scoringRunId: run.id,
+    trigger, predictions: rows.length, scoringRunId: run.id,
   });
-  return { status: 'finalised', scored: preds.length, runId: run.id };
+  return { status: 'finalised', scored: rows.length, runId: run.id };
 }
 
 /** Recalculate every finalised fixture (e.g. after a rules fix). Each fixture is its own transaction. */
@@ -171,13 +286,16 @@ export async function recalculateAll(actor: Actor) {
 
 // ─── Manual results ───────────────────────────────────────────
 
+export type EntryState = 'named' | 'none' | 'unknown' | 'pending';
+
 export interface ManualResultForm {
   arsenalGoals: number;
   opponentGoals: number;
-  /** player id | 'none' */
-  firstScorer: string;
-  /** player id | 'none' */
-  firstAssister: string;
+  scorerState: EntryState;
+  /** Free text; required when scorerState is 'named'. */
+  scorerName: string;
+  assisterState: EntryState;
+  assisterName: string;
   firstGoalOwnGoal: boolean;
   firstGoalUnassisted: boolean;
   status: FixtureStatus;
@@ -185,56 +303,85 @@ export interface ManualResultForm {
   publicNote: string;
 }
 
+const STATES: EntryState[] = ['named', 'none', 'unknown', 'pending'];
+const toKind = (s: EntryState): FirstKind => (s === 'named' ? 'player' : s);
+
+/** Server-side validation of the admin result form. Returns a list of problems (empty = valid). */
+export function validateManualResult(form: ManualResultForm): string[] {
+  const e: string[] = [];
+  for (const [v, label] of [[form.arsenalGoals, 'Arsenal goals'], [form.opponentGoals, 'Opponent goals']] as const) {
+    if (!Number.isInteger(v) || v < 0 || v > 20) e.push(`${label} must be a whole number from 0 to 20.`);
+  }
+  if (!STATES.includes(form.scorerState)) e.push('Choose what you know about the first goalscorer.');
+  if (!STATES.includes(form.assisterState)) e.push('Choose what you know about the first assister: a named player, confirmed no assist, unknown, or not entered yet.');
+  if (form.scorerState === 'named') { const m = validateName(form.scorerName, 'First goalscorer'); if (m) e.push(m); }
+  if (form.assisterState === 'named') { const m = validateName(form.assisterName, 'First assister'); if (m) e.push(m); }
+  if (!['finished', 'abandoned', 'live'].includes(form.status)) e.push('A result can only be saved for a live, finished or abandoned match.');
+  if (e.length) return e;
+  const total = form.arsenalGoals + form.opponentGoals;
+  if (form.firstGoalOwnGoal && total === 0) e.push('A 0–0 match cannot have an own goal.');
+  if (total === 0 && form.scorerState === 'named') e.push('A 0–0 match has no goalscorer: choose "No qualifying goal".');
+  if (total === 0 && form.assisterState === 'named') e.push('A 0–0 match has no assister: choose "Confirmed: no credited assist".');
+  if (total > 0 && form.scorerState === 'none' && !form.firstGoalOwnGoal) {
+    e.push('Goals were scored, so "No qualifying goal" is only possible if every goal was an own goal: tick the own-goal box, or name the scorer.');
+  }
+  if (form.scorerState === 'none' && form.assisterState === 'named') e.push('There cannot be a credited assist when there was no qualifying goal.');
+  return e;
+}
+
 export function manualOutcome(form: ManualResultForm): MatchOutcome {
-  return {
-    arsenalGoals: form.arsenalGoals,
-    opponentGoals: form.opponentGoals,
-    firstScorer: form.firstScorer === 'none' ? { kind: 'none' } : { kind: 'player', id: form.firstScorer },
-    firstAssister: form.firstAssister === 'none' ? { kind: 'none' } : { kind: 'player', id: form.firstAssister },
-    firstGoalWasOwnGoal: form.firstGoalOwnGoal,
-  };
+  return outcomeFromResult({
+    arsenalGoals: form.arsenalGoals, opponentGoals: form.opponentGoals,
+    firstScorerKind: toKind(form.scorerState), firstScorerName: form.scorerState === 'named' ? cleanName(form.scorerName) : null,
+    firstAssisterKind: toKind(form.assisterState), firstAssisterName: form.assisterState === 'named' ? cleanName(form.assisterName) : null,
+    firstGoalOwnGoal: form.firstGoalOwnGoal,
+  });
 }
 
 /**
  * Admin enters or corrects a result. The admin's entry is treated as verified and always wins over the
  * automatic feed (feed differences are flagged, never applied silently). Uses the same scoring engine.
+ * Saving the same result again changes nothing; editing it recalculates the fixture (replacing, never adding).
  */
 export async function saveManualResult(actor: Actor, fixtureId: string, form: ManualResultForm): Promise<
   { ok: true; finalise: FinaliseResult | null } | { ok: false; error: string }
 > {
-  const outcome = manualOutcome(form);
-  if (form.status === 'finished') {
-    const errors = validateOutcome(outcome);
-    if (errors.length) return { ok: false, error: errors.join(' ') };
-  }
-  if (!['finished', 'abandoned', 'live'].includes(form.status)) {
-    return { ok: false, error: 'A result can only be saved for a live, finished or abandoned match.' };
-  }
-  const ids = [form.firstScorer, form.firstAssister].filter((x) => x !== 'none');
+  const errors = validateManualResult(form);
+  if (errors.length) return { ok: false, error: errors.join(' ') };
   return sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
     const f = await getFixture(fixtureId, tx);
     if (!f) return { ok: false as const, error: 'Fixture not found.' };
-    if (ids.length) {
-      const rows = await tx`select id from players where id in ${tx(ids)}`;
-      if (rows.length !== new Set(ids).size) return { ok: false as const, error: 'Unknown player selected.' };
-    }
+    // Store the player's proper spelling when the typed name is an EXACT (case/space-insensitive) match for a
+    // known player in this match. Near-misses are left exactly as typed and flagged at scoring time.
+    const known = await tx<{ name: string }[]>`
+      select name from players where is_arsenal or lower(team_name) = lower(${f.opponent})`;
+    const canonical = (typed: string) => {
+      const k = nameKey(typed);
+      const hits = [...new Set(known.map((p) => cleanName(p.name)).filter((n) => nameKey(n) === k))];
+      return hits.length === 1 ? hits[0] : cleanName(typed);
+    };
+    const scorerName = form.scorerState === 'named' ? canonical(form.scorerName) : null;
+    const assisterName = form.assisterState === 'named' ? canonical(form.assisterName) : null;
     const before = await getResult(fixtureId, tx);
+    // A name-review confirmation only stays valid while the official names are unchanged.
+    const keepReview = !!before?.nameReviewConfirmed
+      && nameKey(before.firstScorerName) === nameKey(scorerName) && nameKey(before.firstAssisterName) === nameKey(assisterName);
     await tx`
       insert into match_results (fixture_id, arsenal_goals, opponent_goals, source,
-        first_scorer_kind, first_scorer_player_id, first_assister_kind, first_assister_player_id,
-        first_goal_own_goal, first_goal_unassisted, player_categories_void, void_reason, issues,
+        first_scorer_kind, first_scorer_name, first_scorer_player_id, first_assister_kind, first_assister_name, first_assister_player_id,
+        first_goal_own_goal, first_goal_unassisted, player_categories_void, void_reason, name_review_confirmed, issues,
         verified, verified_by, verified_at, notes_private, public_note, updated_at)
       values (${fixtureId}, ${form.arsenalGoals}, ${form.opponentGoals}, 'manual',
-        ${outcome.firstScorer.kind}, ${outcome.firstScorer.kind === 'player' ? outcome.firstScorer.id : null},
-        ${outcome.firstAssister.kind}, ${outcome.firstAssister.kind === 'player' ? outcome.firstAssister.id : null},
-        ${form.firstGoalOwnGoal}, ${form.firstGoalUnassisted}, false, null, '[]'::jsonb,
+        ${toKind(form.scorerState)}, ${scorerName}, null, ${toKind(form.assisterState)}, ${assisterName}, null,
+        ${form.firstGoalOwnGoal}, ${form.firstGoalUnassisted}, false, null, ${keepReview}, '[]'::jsonb,
         true, ${actor.id}, now(), ${form.notesPrivate || null}, ${form.publicNote || null}, now())
       on conflict (fixture_id) do update set
         arsenal_goals = excluded.arsenal_goals, opponent_goals = excluded.opponent_goals, source = 'manual',
-        first_scorer_kind = excluded.first_scorer_kind, first_scorer_player_id = excluded.first_scorer_player_id,
-        first_assister_kind = excluded.first_assister_kind, first_assister_player_id = excluded.first_assister_player_id,
+        first_scorer_kind = excluded.first_scorer_kind, first_scorer_name = excluded.first_scorer_name, first_scorer_player_id = null,
+        first_assister_kind = excluded.first_assister_kind, first_assister_name = excluded.first_assister_name, first_assister_player_id = null,
         first_goal_own_goal = excluded.first_goal_own_goal, first_goal_unassisted = excluded.first_goal_unassisted,
-        player_categories_void = false, void_reason = null, issues = '[]'::jsonb,
+        player_categories_void = false, void_reason = null, name_review_confirmed = excluded.name_review_confirmed, issues = '[]'::jsonb,
         verified = true, verified_by = excluded.verified_by, verified_at = now(),
         notes_private = excluded.notes_private, public_note = excluded.public_note, updated_at = now()`;
     await tx`
@@ -244,11 +391,19 @@ export async function saveManualResult(actor: Actor, fixtureId: string, form: Ma
       where id = ${fixtureId}`;
     await audit(tx, actor, before ? 'result.corrected' : 'result.entered', 'fixture', fixtureId, {
       before: before ? resultSummary(before) : null,
-      after: { score: `${form.arsenalGoals}-${form.opponentGoals}`, firstScorer: form.firstScorer, firstAssister: form.firstAssister,
-        ownGoal: form.firstGoalOwnGoal, unassisted: form.firstGoalUnassisted, status: form.status },
+      after: {
+        score: `${form.arsenalGoals}-${form.opponentGoals}`,
+        firstScorer: scorerName ?? form.scorerState, firstAssister: assisterName ?? form.assisterState,
+        ownGoal: form.firstGoalOwnGoal, unassisted: form.firstGoalUnassisted, status: form.status,
+      },
     });
     let finalise: FinaliseResult | null = null;
-    if (form.status === 'finished') finalise = await finaliseInTx(tx, fixtureId, actor, 'manual_result', { confirmReview: true });
+    // Finished → score. Abandoned → finaliseInTx voids the fixture and removes any stored awards.
+    if (form.status === 'finished' || form.status === 'abandoned') finalise = await finaliseInTx(tx, fixtureId, actor, 'manual_result', { confirmReview: true });
+    else if (form.status === 'live') {
+      await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
+      await tx`update fixtures set scoring_status = 'not_ready' where id = ${fixtureId}`;
+    }
     return { ok: true as const, finalise };
   });
 }
@@ -265,6 +420,7 @@ function resultSummary(r: StoredResult) {
 /** Admin confirms an automatic result as correct (including an own-goal-first match) and publishes points. */
 export async function verifyResult(actor: Actor, fixtureId: string): Promise<FinaliseResult | { status: 'error'; reason: string }> {
   return sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
     const r = await getResult(fixtureId, tx);
     if (!r) return { status: 'error' as const, reason: 'No result to verify.' };
     await tx`update match_results set verified = true, verified_by = ${actor.id}, verified_at = now() where fixture_id = ${fixtureId}`;
@@ -275,12 +431,29 @@ export async function verifyResult(actor: Actor, fixtureId: string): Promise<Fin
 }
 
 /**
+ * Admin has looked at the near-miss names flagged for this match and confirms they are DIFFERENT players,
+ * so only exact name matches score. (If they are the same player, the admin corrects the official name instead.)
+ */
+export async function confirmNameReview(actor: Actor, fixtureId: string): Promise<FinaliseResult | { status: 'error'; reason: string }> {
+  return sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
+    const before = await checkPredictions(fixtureId, tx);
+    if (!before.result) return { status: 'error' as const, reason: 'No result to review.' };
+    const notes = before.rows.flatMap((x) => x.reviewNotes.map((n) => `${x.displayName}: ${n}`));
+    await tx`update match_results set name_review_confirmed = true, updated_at = now() where fixture_id = ${fixtureId}`;
+    await audit(tx, actor, 'result.name_review_confirmed', 'fixture', fixtureId, { decision: 'different players; exact matches only', notes });
+    return finaliseInTx(tx, fixtureId, actor, 'admin_name_review', { confirmReview: true });
+  });
+}
+
+/**
  * Documented competition decision for when reliable scorer/assister data does not exist:
  * the goalscorer and assister categories score 0 for everyone; result and total goals still count.
  */
 export async function finaliseWithPlayerCategoriesVoid(actor: Actor, fixtureId: string, reason: string) {
   if (!reason || reason.trim().length < 10) return { status: 'error' as const, reason: 'Record a reason of at least 10 characters.' };
   return sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
     const r = await getResult(fixtureId, tx);
     if (!r) return { status: 'error' as const, reason: 'Enter at least the final score first.' };
     await tx`
@@ -296,6 +469,7 @@ export async function finaliseWithPlayerCategoriesVoid(actor: Actor, fixtureId: 
 export async function reopenScoring(actor: Actor, fixtureId: string, reason: string) {
   if (!reason || reason.trim().length < 5) return { ok: false as const, error: 'Give a reason.' };
   await sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
     await tx`select 1 from fixtures where id = ${fixtureId} for update`;
     await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
     await tx`update fixtures set scoring_status = 'review_required', review_reason = ${'Reopened: ' + reason.trim()}, updated_at = now() where id = ${fixtureId}`;
@@ -407,6 +581,23 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
       derived.issues = [];
     }
 
+    // Convert the feed outcome from our player ids to official NAMES, the same identity manual results use.
+    const idToName = new Map<string, string>();
+    const ids = [derived.outcome.firstScorer, derived.outcome.firstAssister].flatMap((x) => (x.kind === 'player' ? [x.id] : []));
+    if (ids.length) {
+      for (const row of await tx<{ id: string; name: string }[]>`select id, name from players where id in ${tx(ids)}`) idToName.set(row.id, cleanName(row.name));
+    }
+    const named = (x: FirstPlayer): { kind: FirstKind; name: string | null } =>
+      x.kind === 'player' ? (idToName.get(x.id) ? { kind: 'player', name: idToName.get(x.id)! } : { kind: 'unknown', name: null }) : { kind: x.kind, name: null };
+    const feedScorer = named(derived.outcome.firstScorer);
+    const feedAssister = named(derived.outcome.firstAssister);
+    const feedOutcome = outcomeFromResult({
+      arsenalGoals: feed.arsenalGoals, opponentGoals: feed.opponentGoals,
+      firstScorerKind: feedScorer.kind, firstScorerName: feedScorer.name,
+      firstAssisterKind: feedAssister.kind, firstAssisterName: feedAssister.name,
+      firstGoalOwnGoal: derived.outcome.firstGoalWasOwnGoal,
+    });
+
     await tx`
       insert into feed_results (fixture_id, provider, arsenal_goals, opponent_goals, status, events, fetched_at)
       values (${fixtureId}, ${provider}, ${feed.arsenalGoals}, ${feed.opponentGoals}, ${feed.status}, ${tx.json({ goals: feed.goals, substitutions: feed.substitutions } as never)}, now())
@@ -432,7 +623,7 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
     const existing = await getResult(fixtureId, tx);
     if (existing && existing.source === 'manual') {
       // Admin data wins. Flag (don't apply) any difference.
-      const same = outcomeSignature(outcomeFromResult(existing)) === outcomeSignature(derived.outcome);
+      const same = outcomeSignature(outcomeFromResult(existing)) === outcomeSignature(feedOutcome);
       const scoreSame = existing.arsenalGoals === feed.arsenalGoals && existing.opponentGoals === feed.opponentGoals;
       const msg = same ? null : scoreSame && derived.issues.length ? null
         : `Feed differs from the admin-entered result (feed ${feed.arsenalGoals}-${feed.opponentGoals}).`;
@@ -442,7 +633,7 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
     }
 
     // A finalised fixture is never un-scored because a later feed response is less complete.
-    if (existing && f.scoringStatus === 'finalised' && !isScoreable(derived.outcome)) {
+    if (existing && f.scoringStatus === 'finalised' && !isScoreable(feedOutcome)) {
       const sameScore = existing.arsenalGoals === feed.arsenalGoals && existing.opponentGoals === feed.opponentGoals;
       const msg = sameScore ? null : `Feed now reports ${feed.arsenalGoals}-${feed.opponentGoals}; check and correct the result if needed.`;
       await tx`update feed_results set discrepancy = ${msg} where fixture_id = ${fixtureId}`;
@@ -450,21 +641,24 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
       return msg ? 'discrepancy flagged' : 'kept finalised result';
     }
 
-    const changed = existing ? outcomeSignature(outcomeFromResult(existing)) !== outcomeSignature(derived.outcome) : true;
-    const o = derived.outcome;
+    const changed = existing ? outcomeSignature(outcomeFromResult(existing)) !== outcomeSignature(feedOutcome) : true;
+    const o = feedOutcome;
+    const sid = derived.outcome.firstScorer.kind === 'player' && feedScorer.kind === 'player' ? derived.outcome.firstScorer.id : null;
+    const aid = derived.outcome.firstAssister.kind === 'player' && feedAssister.kind === 'player' ? derived.outcome.firstAssister.id : null;
     await tx`
       insert into match_results (fixture_id, arsenal_goals, opponent_goals, source,
-        first_scorer_kind, first_scorer_player_id, first_assister_kind, first_assister_player_id,
+        first_scorer_kind, first_scorer_name, first_scorer_player_id, first_assister_kind, first_assister_name, first_assister_player_id,
         first_goal_own_goal, first_goal_unassisted, issues, verified, updated_at)
       values (${fixtureId}, ${o.arsenalGoals}, ${o.opponentGoals}, 'automatic',
-        ${o.firstScorer.kind}, ${o.firstScorer.kind === 'player' ? o.firstScorer.id : null},
-        ${o.firstAssister.kind}, ${o.firstAssister.kind === 'player' ? o.firstAssister.id : null},
+        ${feedScorer.kind}, ${feedScorer.name}, ${sid},
+        ${feedAssister.kind}, ${feedAssister.name}, ${aid},
         ${o.firstGoalWasOwnGoal}, ${goals?.find((g) => g.type === 'goal')?.assist.status === 'unassisted'},
         ${tx.json(derived.issues as never)}, false, now())
       on conflict (fixture_id) do update set
         arsenal_goals = excluded.arsenal_goals, opponent_goals = excluded.opponent_goals,
-        first_scorer_kind = excluded.first_scorer_kind, first_scorer_player_id = excluded.first_scorer_player_id,
-        first_assister_kind = excluded.first_assister_kind, first_assister_player_id = excluded.first_assister_player_id,
+        first_scorer_kind = excluded.first_scorer_kind, first_scorer_name = excluded.first_scorer_name, first_scorer_player_id = excluded.first_scorer_player_id,
+        first_assister_kind = excluded.first_assister_kind, first_assister_name = excluded.first_assister_name, first_assister_player_id = excluded.first_assister_player_id,
+        name_review_confirmed = case when ${changed} then false else match_results.name_review_confirmed end,
         first_goal_own_goal = excluded.first_goal_own_goal, first_goal_unassisted = excluded.first_goal_unassisted,
         issues = excluded.issues,
         verified = case when ${changed} then false else match_results.verified end,
@@ -488,9 +682,11 @@ export async function fixtureScores(fixtureId: string) {
   return sql<{
     memberId: string; displayName: string; scorerPoints: number; scorerOutcome: string; assisterPoints: number; assisterOutcome: string;
     resultPoints: number; totalGoalsPoints: number; bonusPoints: number; totalPoints: number;
+    predictedScorer: string | null; predictedAssister: string | null; officialScorer: string | null; officialAssister: string | null;
   }[]>`
     select s.member_id, m.display_name, s.scorer_points, s.scorer_outcome, s.assister_points, s.assister_outcome,
-           s.result_points, s.total_goals_points, s.bonus_points, s.total_points
+           s.result_points, s.total_goals_points, s.bonus_points, s.total_points,
+           s.predicted_scorer, s.predicted_assister, s.official_scorer, s.official_assister
     from fixture_scores s join members m on m.id = s.member_id
     join fixtures f on f.id = s.fixture_id and f.scoring_status = 'finalised'
     where s.fixture_id = ${fixtureId}`;

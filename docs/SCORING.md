@@ -25,6 +25,21 @@ All points come from one function: `scorePrediction` in `src/lib/scoring.ts`. Ma
 - **Abandoned / cancelled** matches score nothing. **Postponed** matches close predictions and reopen when rescheduled.
 - Picks are never changed after kick-off, whatever happens to the player.
 
+## Entering official results (admin)
+
+The first goalscorer and first assister are typed as names (no dropdowns), and each has one of four explicit states. Nothing is pre-selected for a new result, and a blank field is never treated as "none".
+
+| State | Meaning | Scoring |
+|---|---|---|
+| Named player | the name typed | scored by name match |
+| No qualifying goal / Confirmed: no credited assist | the confirmed answer is "nobody" | "No goalscorer" / "No assister" picks win |
+| Unknown | the information isn't available | match held, nothing scored |
+| Not entered yet | to be filled in later | match held, nothing scored |
+
+**Name matching** (`src/lib/names.ts`): capitals, extra spaces, curly v straight apostrophes and dash styles don't matter, so `Bukayo Saka`, `bukayo saka` and ` Bukayo  Saka ` match. Spelling and accents do matter. A near-miss (`Martin Odegaard` v `Martin Ødegaard`, `Saka` v `Bukayo Saka`) is never scored automatically: the match is held and the admin either corrects the official name or confirms they're different players (exact matches only). There is no substring matching. When a typed name exactly matches a known player, the proper spelling is stored.
+
+**Stored breakdown:** every member's row in `fixture_scores` records the points per category plus a snapshot of their predicted score and picks and the official score and names used, so any award can be audited later.
+
 ## Note on the brief's examples A and B
 
 The brief's Examples A and B both predict Arsenal 3–1 against an actual 2–2 and award the result point. Under the written result rule, 3–1 (Arsenal win) and 2–2 (draw) are different results, so the engine does **not** award it: Example A scores 11 (not 15) and Example B scores 1 (not 2). Both readings are covered by tests in `tests/unit/scoring.test.ts`. If the league wants a different rule, it is a one-line change in `scorePrediction` followed by **Admin → Points → Recalculate every scored match**.

@@ -10,7 +10,7 @@ import { requireAdmin } from '@/lib/session';
 import type { Actor } from '@/lib/audit';
 import * as members from '@/lib/members';
 import { createFixture, updateFixture, setFixtureAutoSync, addPlayer, setPlayerActive, seasonFor, type FixtureInput, type FixtureStatus } from '@/lib/fixtures';
-import { saveManualResult, verifyResult, finaliseWithPlayerCategoriesVoid, reopenScoring, finaliseFixture, recalculateAll } from '@/lib/results';
+import { saveManualResult, verifyResult, confirmNameReview, type EntryState, finaliseWithPlayerCategoriesVoid, reopenScoring, finaliseFixture, recalculateAll } from '@/lib/results';
 import { adminOverridePrediction, parseGoals } from '@/lib/predictions';
 import { updateSetting } from '@/lib/settings';
 import { syncFixtures, syncResults, syncSquads, syncLineups } from '@/lib/sync';
@@ -133,8 +133,11 @@ export async function manualResultAction(_p: AdminState, f: FormData): Promise<A
   if (str(f, 'confirm') !== 'yes') return { error: 'Tick the box to confirm you want to publish this result.' };
   const r = await saveManualResult(a, id, {
     arsenalGoals: ag, opponentGoals: og,
-    firstScorer: str(f, 'firstScorer') || 'none',
-    firstAssister: str(f, 'firstAssister') || 'none',
+    // No defaults: a blank or unselected choice is rejected by the server, never treated as "none".
+    scorerState: str(f, 'scorerState') as EntryState,
+    scorerName: String(f.get('scorerName') ?? ''),
+    assisterState: str(f, 'assisterState') as EntryState,
+    assisterName: String(f.get('assisterName') ?? ''),
     firstGoalOwnGoal: f.get('ownGoal') === 'on',
     firstGoalUnassisted: f.get('unassisted') === 'on',
     status: (str(f, 'status') || 'finished') as FixtureStatus,
@@ -144,6 +147,14 @@ export async function manualResultAction(_p: AdminState, f: FormData): Promise<A
   if (!r.ok) return { error: r.error };
   const msg = r.finalise?.status === 'finalised' ? `Result published and ${r.finalise.scored} prediction(s) scored.` : r.finalise ? `Result saved, but not scored: ${r.finalise.reason}` : 'Result saved.';
   return done(msg, `/admin/fixtures/${id}`, '/', '/table');
+}
+
+export async function confirmNameReviewAction(_p: AdminState, f: FormData): Promise<AdminState> {
+  const a = await actor();
+  const id = str(f, 'fixtureId');
+  const r = await confirmNameReview(a, id);
+  if (r.status === 'finalised') return done(`Confirmed. Only exact name matches scored: ${r.scored} prediction(s).`, `/admin/fixtures/${id}`, '/', '/table');
+  return { error: r.reason };
 }
 
 export async function verifyResultAction(_p: AdminState, f: FormData): Promise<AdminState> {

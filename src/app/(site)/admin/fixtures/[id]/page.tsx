@@ -3,7 +3,9 @@ import { notFound } from 'next/navigation';
 import { requireAdmin } from '@/lib/session';
 import { getFixture, listCompetitions, playersForFixture, displayStatus, type FixturePlayer } from '@/lib/fixtures';
 import { predictionsForFixture } from '@/lib/predictions';
-import { getResult, getFeed, fixtureScores, matchEvents } from '@/lib/results';
+import { getResult, getFeed, fixtureScores, matchEvents, checkPredictions } from '@/lib/results';
+import { OfficialPlayerField } from './OfficialPlayerField';
+import { ScoringTable } from './ScoringTable';
 import { sql } from '@/lib/db';
 import { formatKickoff, formatDateTime, ukZoneLabel } from '@/lib/time';
 import { StatusChip, SourceChip, venueText, Alert } from '@/components/bits';
@@ -11,7 +13,7 @@ import { ActionForm } from '@/components/ActionForm';
 import { FixtureFields } from '@/components/FixtureFields';
 import {
   updateFixtureAction, fixtureSyncToggleAction, manualResultAction, verifyResultAction, voidPlayerCategoriesAction,
-  reopenAction, recalcFixtureAction, overridePredictionAction,
+  reopenAction, recalcFixtureAction, overridePredictionAction, confirmNameReviewAction,
 } from '../../actions';
 
 export const metadata = { title: 'Manage fixture' };
@@ -43,6 +45,14 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
     sql<{ id: string; displayName: string }[]>`select id, display_name from members where is_active order by lower(display_name)`,
   ]);
   const scoreBy = new Map(scores.map((s) => [s.memberId, s]));
+  const { rows: checks } = await checkPredictions(id);
+  const reviewRows = fixture.scoringStatus === 'finalised' ? [] : checks.filter((c) => c.reviewNotes.length > 0);
+  const overrides = new Map(preds.filter((p) => p.overrideReason).map((p) => [p.memberId, p.overrideReason!]));
+  // Suggestions for the free-text name fields: names members actually picked, plus any loaded squad.
+  const suggestions = [...new Set([
+    ...checks.flatMap((c) => [c.scorerPick, c.assisterPick]).filter((n): n is string => !!n),
+    ...players.map((p) => p.name),
+  ])].sort((a, b) => a.localeCompare(b));
   const finalised = fixture.scoringStatus === 'finalised';
   const status = displayStatus(fixture, false);
   const r = result;
@@ -139,18 +149,17 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
               <span className="sb-dash" aria-hidden>–</span>
               <div><label htmlFor="mr-og">{fixture.opponent}</label><input id="mr-og" name="opponentGoals" type="number" min={0} max={20} required defaultValue={r?.opponentGoals} /></div>
             </div>
-            <div className="field">
-              <label htmlFor="mr-scorer">First goalscorer (first non-own-goal)</label>
-              <select id="mr-scorer" name="firstScorer" defaultValue={r?.firstScorerPlayerId ?? 'none'}>
-                <PlayerOptions players={players} noneLabel="None: 0–0, or only own goals" />
-              </select>
-            </div>
-            <div className="field">
-              <label htmlFor="mr-assister">First credited assister (any qualifying goal, in order)</label>
-              <select id="mr-assister" name="firstAssister" defaultValue={r?.firstAssisterPlayerId ?? 'none'}>
-                <PlayerOptions players={players} noneLabel="None: no assisted goal" />
-              </select>
-            </div>
+            <OfficialPlayerField
+              role="scorer" legend="First goalscorer" hint="Scorer of the first goal that isn't an own goal, either team."
+              kind={r?.firstScorerKind} name={r?.firstScorerName} listId="name-suggestions"
+              noneLabel="No qualifying goal (0–0, or only own goals)"
+            />
+            <OfficialPlayerField
+              role="assister" legend="First assister" hint="First player officially credited with an assist, in match order. Skip unassisted goals."
+              kind={r?.firstAssisterKind} name={r?.firstAssisterName} listId="name-suggestions"
+              noneLabel="Confirmed: no credited assist in the match"
+            />
+            <datalist id="name-suggestions">{suggestions.map((n) => <option key={n} value={n} />)}</datalist>
             <div className="field"><label className="checkbox"><input type="checkbox" name="ownGoal" defaultChecked={r?.firstGoalOwnGoal} /> The first goal of the match was an own goal</label></div>
             <div className="field"><label className="checkbox"><input type="checkbox" name="unassisted" defaultChecked={r?.firstGoalUnassisted} /> The first qualifying goal was unassisted</label></div>
             <div className="field">
@@ -165,35 +174,26 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
             <div className="field"><label htmlFor="mr-private">Admin-only notes (optional)</label><textarea id="mr-private" name="notesPrivate" maxLength={2000} defaultValue={r?.notesPrivate ?? ''} /></div>
             <div className="field"><label className="checkbox"><input type="checkbox" name="confirm" value="yes" required /> I&rsquo;ve checked this and want to publish it</label></div>
           </ActionForm>
-          {players.length === 0 && <p className="small muted">No players loaded for this match. Add them in <Link href="/admin/players">Players</Link>.</p>}
+          <p className="small muted">Type names exactly as they appear in members&rsquo; picks (suggestions appear as you type). Capitals and extra spaces don&rsquo;t matter; spelling and accents do. Near-misses are flagged for you to check, never guessed.</p>
         </section>
       </div>
 
       <section className="panel">
-        <div className="panel-head"><h2>Predictions ({preds.length})</h2><span className="small muted">Admins can always see these. Members see them after kick-off.</span></div>
-        {preds.length === 0 ? <p className="muted">No predictions yet.</p> : (
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Member</th><th className="c">Score</th><th>Scorer</th><th>Assister</th><th>Saved</th>{finalised && <><th className="r">Breakdown</th><th className="r">Total</th></>}</tr></thead>
-              <tbody>
-                {preds.map((p) => {
-                  const s = scoreBy.get(p.memberId);
-                  return (
-                    <tr key={p.memberId}>
-                      <td><strong>{p.displayName}</strong>{p.overrideReason && <div className="small" style={{ color: 'var(--warn)' }}>Set by admin: {p.overrideReason}</div>}</td>
-                      <td className="c num">{p.arsenalGoals}–{p.opponentGoals}</td>
-                      <td>{p.scorerNone ? 'None' : p.scorerName}</td>
-                      <td>{p.assisterNone ? 'None' : p.assisterName}</td>
-                      <td className="small muted">{formatDateTime(p.updatedAt)}</td>
-                      {finalised && <><td className="r small num">{s ? `${s.scorerPoints}/${s.assisterPoints}/${s.resultPoints}/${s.totalGoalsPoints}/+${s.bonusPoints}` : '–'}</td><td className="r points-cell">{s?.totalPoints ?? 0}</td></>}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+        <div className="panel-head"><h2>Predictions and scoring ({preds.length})</h2><span className="small muted">Admins can always see these. Members see them after kick-off.</span></div>
+        {reviewRows.length > 0 && (
+          <div className="alert alert-warn">
+            <p style={{ marginBottom: 8 }}><strong>Check these names before points are given.</strong> They look like the official player but aren&rsquo;t an exact match:</p>
+            <ul style={{ margin: '0 0 12px' }}>{reviewRows.flatMap((x) => x.reviewNotes.map((n, i) => <li key={x.memberId + i}>{x.displayName}: {n}</li>))}</ul>
+            <p className="small" style={{ marginBottom: 10 }}>Same player? Correct the official name in the result form so it matches exactly, then publish again. Different players? Confirm below and only exact matches will score.</p>
+            <ActionForm action={confirmNameReviewAction} submitLabel="They're different players: score exact matches only" submitClass="btn btn-small" confirm="Confirm these are different players? Their picks will score 0 for this category.">
+              <input type="hidden" name="fixtureId" value={id} />
+            </ActionForm>
           </div>
         )}
-        {finalised && <p className="small muted">Breakdown: scorer / assister / result / total goals / bonus.</p>}
+        {checks.length === 0 ? <p className="muted">No predictions yet.</p> : (
+          <ScoringTable checks={checks} scores={scoreBy} result={r} finalised={finalised} overrides={overrides} />
+        )}
+        <p className="small muted">Green = correct (5). Amber = crossover (3). Red = no match. &ldquo;Check&rdquo; = near-miss name waiting for you. &ldquo;Waiting&rdquo; = the official answer isn&rsquo;t entered or is unknown. {finalised ? 'Points shown are the stored, published breakdown.' : 'No points are published until the match is scored.'}</p>
         <details className="inline" style={{ marginTop: 16 }}>
           <summary>Set a prediction for a member (admin override)</summary>
           <p className="small muted">Only for genuine cases, e.g. a member sent their prediction before kick-off but couldn&rsquo;t log in. The reason is recorded in the audit log. If the match is already scored it is rescored.</p>
