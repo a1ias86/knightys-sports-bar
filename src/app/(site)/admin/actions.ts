@@ -10,9 +10,10 @@ import { requireAdmin } from '@/lib/session';
 import type { Actor } from '@/lib/audit';
 import * as members from '@/lib/members';
 import { createFixture, updateFixture, setFixtureAutoSync, seasonFor, type FixtureInput, type FixtureStatus } from '@/lib/fixtures';
-import { saveManualResult, verifyResult, confirmNameReview, type EntryState, finaliseWithPlayerCategoriesVoid, reopenScoring, finaliseFixture, recalculateAll } from '@/lib/results';
+import { saveManualResult, verifyResult, confirmNameReview, type EntryState, finaliseWithPlayerCategoriesVoid, reopenScoring, rescoreFixture, type FinaliseResult } from '@/lib/results';
 import { adminOverridePrediction, parseGoals } from '@/lib/predictions';
 import { updateSetting } from '@/lib/settings';
+import { addHallOfFame, updateHallOfFame, deleteHallOfFame } from '@/lib/hall-of-fame';
 import { syncFixtures, syncResults, syncSquads, syncLineups } from '@/lib/sync';
 import { ukLocalToUtc } from '@/lib/time';
 import { sql } from '@/lib/db';
@@ -25,6 +26,12 @@ async function actor(): Promise<Actor> {
   return { id: m.id, displayName: m.displayName };
 }
 const str = (f: FormData, k: string) => String(f.get(k) ?? '').trim();
+function resultMessage(fin: FinaliseResult | null): string {
+  if (!fin) return 'Result saved.';
+  if (fin.status === 'finalised') return `Result published and ${fin.scored} prediction(s) scored with the ${fin.rulesVersion === 2 ? '20' : '15'}-point rules.`;
+  if (fin.status === 'protected') return `Result saved. ${fin.reason}`;
+  return `Result saved, but not scored: ${fin.reason}`;
+}
 const done = (ok: string, ...paths: string[]): AdminState => {
   for (const p of paths) revalidatePath(p);
   return { ok };
@@ -147,7 +154,7 @@ export async function manualResultAction(_p: AdminState, f: FormData): Promise<A
     publicNote: str(f, 'publicNote').slice(0, 500),
   });
   if (!r.ok) return { error: r.error };
-  const msg = r.finalise?.status === 'finalised' ? `Result published and ${r.finalise.scored} prediction(s) scored.` : r.finalise ? `Result saved, but not scored: ${r.finalise.reason}` : 'Result saved.';
+  const msg = resultMessage(r.finalise);
   return done(msg, `/admin/fixtures/${id}`, '/', '/table');
 }
 
@@ -183,20 +190,14 @@ export async function reopenAction(_p: AdminState, f: FormData): Promise<AdminSt
   return done('Scoring reopened. Points for this match are withdrawn until it is finalised again.', `/admin/fixtures/${id}`, '/table');
 }
 
-export async function recalcFixtureAction(_p: AdminState, f: FormData): Promise<AdminState> {
+/** Explicit, audited rescore of ONE match (the only way an already-scored match's points change). */
+export async function rescoreFixtureAction(_p: AdminState, f: FormData): Promise<AdminState> {
   const a = await actor();
   const id = str(f, 'fixtureId');
-  const r = await finaliseFixture(id, a, 'recalculate', { confirmReview: true });
-  if (r.status === 'finalised') return done(`Recalculated ${r.scored} prediction(s). Opening balances and adjustments are untouched.`, `/admin/fixtures/${id}`, '/table');
+  if (str(f, 'confirm') !== 'RESCORE') return { error: 'Type RESCORE to confirm.' };
+  const r = await rescoreFixture(a, id, str(f, 'reason'));
+  if (r.status === 'finalised') return done(`Rescored ${r.scored} prediction(s) with the ${r.rulesVersion === 2 ? '20' : '15'}-point rules this match was originally scored with. Logged in the audit log.`, `/admin/fixtures/${id}`, '/', '/table');
   return { error: r.reason };
-}
-
-export async function recalcAllAction(): Promise<AdminState> {
-  const a = await actor();
-  const results = await recalculateAll(a);
-  const failed = results.filter((r) => r.result.status !== 'finalised');
-  revalidatePath('/table');
-  return failed.length ? { error: `${failed.length} fixture(s) could not be recalculated and are now flagged for review.` } : { ok: `Recalculated ${results.length} fixture(s).` };
 }
 
 export async function overridePredictionAction(_p: AdminState, f: FormData): Promise<AdminState> {
@@ -211,8 +212,8 @@ export async function overridePredictionAction(_p: AdminState, f: FormData): Pro
     assister: f.get('assisterNone') === 'on' ? null : String(f.get('assister') ?? ''),
   }, str(f, 'reason'));
   if (!r.ok) return { error: r.error };
-  if (r.needsRescore) await finaliseFixture(id, a, 'prediction_override', { confirmReview: true });
-  return done(r.needsRescore ? 'Prediction set and the match rescored.' : 'Prediction set.', `/admin/fixtures/${id}`);
+  // Never rescored automatically: an already-scored match keeps its points until an admin rescores it.
+  return done(r.needsRescore ? 'Prediction set. This match is already scored, so points did not change: use "Rescore this match" if they should.' : 'Prediction set.', `/admin/fixtures/${id}`);
 }
 
 // ─── Points ───────────────────────────────────────────────────
@@ -250,4 +251,41 @@ export async function syncAction(_p: AdminState, f: FormData): Promise<AdminStat
   const r = await fn();
   revalidatePath('/admin');
   return r.status === 'error' ? { error: `Sync failed: ${r.message}` } : { ok: `${job}: ${r.message}` };
+}
+
+// ─── Hall of Fame ─────────────────────────────────────────────
+
+function hofInput(f: FormData) {
+  return {
+    season: str(f, 'season'),
+    winnerName: String(f.get('winnerName') ?? ''),
+    memberId: str(f, 'memberId') || null,
+    points: str(f, 'points') || null,
+    summary: String(f.get('summary') ?? ''),
+  };
+}
+
+export async function addHallOfFameAction(_p: AdminState, f: FormData): Promise<AdminState> {
+  const a = await actor();
+  const r = await addHallOfFame(a, hofInput(f));
+  if (!r.ok) return { error: r.error };
+  return done('Champion added to the Hall of Fame.', '/admin/hall-of-fame', '/hall-of-fame');
+}
+
+export async function updateHallOfFameAction(_p: AdminState, f: FormData): Promise<AdminState> {
+  const a = await actor();
+  const r = await updateHallOfFame(a, str(f, 'id'), hofInput(f));
+  if (!r.ok) return { error: r.error };
+  return done('Entry updated.', '/admin/hall-of-fame', '/hall-of-fame');
+}
+
+export async function deleteHallOfFameAction(_p: AdminState, f: FormData): Promise<AdminState> {
+  const a = await actor();
+  if (str(f, 'confirm') !== 'yes') return { error: 'Tick the box to confirm the deletion.' };
+  const r = await deleteHallOfFame(a, str(f, 'id'));
+  if (!r.ok) return { error: r.error };
+  revalidatePath('/admin/hall-of-fame');
+  revalidatePath('/hall-of-fame');
+  // The deleted entry's form disappears with it, so confirm on the page instead.
+  redirect('/admin/hall-of-fame?deleted=1');
 }

@@ -13,7 +13,18 @@ export const metadata = { title: 'Admin' };
 export default async function AdminHome() {
   await requireAdmin();
   const provider = getProvider();
-  const [attention, discrepancies, locked, noPin, runs, okRuns, history] = await Promise.all([
+  const [ambiguous, attention, discrepancies, locked, noPin, runs, okRuns, history] = await Promise.all([
+    // Inconsistent scoring records: left untouched by every automatic process until an admin checks them.
+    sql<{ id: string; opponent: string; venue: string; kickoffAt: Date; scoringStatus: string; rows: number; runs: number }[]>`
+      select f.id, f.opponent, f.venue, f.kickoff_at, f.scoring_status,
+        (select count(*)::int from fixture_scores s where s.fixture_id = f.id) as rows,
+        (select count(*)::int from scoring_runs r where r.fixture_id = f.id and r.status = 'success') as runs
+      from fixtures f
+      where (f.scoring_status = 'finalised' and not exists (select 1 from scoring_runs r where r.fixture_id = f.id and r.status = 'success')
+                                          and not exists (select 1 from fixture_scores s where s.fixture_id = f.id))
+         or (f.scoring_status <> 'finalised' and exists (select 1 from fixture_scores s where s.fixture_id = f.id))
+         or (select count(distinct coalesce(s.rules_version, 1)) from fixture_scores s where s.fixture_id = f.id) > 1
+      order by f.kickoff_at`,
     sql<{ id: string; opponent: string; venue: string; kickoffAt: Date; status: string; scoringStatus: string; reviewReason: string | null }[]>`
       select id, opponent, venue, kickoff_at, status, scoring_status, review_reason from fixtures
       where (status = 'finished' and scoring_status in ('not_ready', 'awaiting_verification', 'review_required'))
@@ -36,6 +47,18 @@ export default async function AdminHome() {
 
       <section className="panel">
         <h2>Needs attention</h2>
+        {ambiguous.length > 0 && (
+          <div className="alert alert-error">
+            <p style={{ marginBottom: 8 }}><strong>Scoring records that need checking.</strong> These were left exactly as they are; nothing automatic will change them.</p>
+            <ul style={{ margin: 0 }}>
+              {ambiguous.map((a) => (
+                <li key={a.id}>
+                  <Link href={`/admin/fixtures/${a.id}`}>{venueText(a.venue, a.opponent)}</Link>, {formatKickoff(a.kickoffAt)}: status &ldquo;{a.scoringStatus.replace(/_/g, ' ')}&rdquo;, {a.rows} stored point row(s), {a.runs} scoring run(s)
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {attention.length === 0 && discrepancies.length === 0 && locked.length === 0 && withoutPin === 0 ? (
           <p className="muted">Nothing waiting. All finished matches are scored.</p>
         ) : (

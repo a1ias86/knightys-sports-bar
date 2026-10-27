@@ -1,6 +1,9 @@
 /**
  * Free-text official results: explicit scorer/assister states, name matching, review gating,
  * idempotent re-saves, edits, adjustments and leaderboard consistency.
+ *
+ * This fixture is scored for the first time with the 20-point rules. Every later correction goes through the
+ * explicit "Rescore this match" action (saving a corrected result alone never changes points).
  */
 import { resetDatabase } from './helpers';
 import { test, describe, before, after } from 'node:test';
@@ -8,7 +11,7 @@ import assert from 'node:assert/strict';
 import { sql, closeDb } from '../../src/lib/db';
 import { createFixture } from '../../src/lib/fixtures';
 import { savePrediction } from '../../src/lib/predictions';
-import { saveManualResult, confirmNameReview, checkPredictions, type ManualResultForm } from '../../src/lib/results';
+import { saveManualResult, confirmNameReview, checkPredictions, rescoreFixture, reopenScoring, type ManualResultForm } from '../../src/lib/results';
 import { addAdjustment } from '../../src/lib/members';
 import type { Actor } from '../../src/lib/audit';
 
@@ -19,10 +22,11 @@ const member = async (name: string) => (await sql<{ id: string }[]>`select id fr
 const matchPoints = async (name: string) =>
   (await sql<{ matchPoints: number }[]>`select match_points from member_totals where display_name = ${name}`)[0].matchPoints;
 const scoreRow = async (name: string) => (await sql<{
+  exactScorePoints: number | null; rulesVersion: number | null;
   scorerPoints: number; assisterPoints: number; resultPoints: number; totalGoalsPoints: number; bonusPoints: number; totalPoints: number;
   predictedScorer: string; officialScorer: string; officialAssister: string;
 }[]>`
-  select s.scorer_points, s.assister_points, s.result_points, s.total_goals_points, s.bonus_points, s.total_points,
+  select s.exact_score_points, s.rules_version, s.scorer_points, s.assister_points, s.result_points, s.total_goals_points, s.bonus_points, s.total_points,
          s.predicted_scorer, s.official_scorer, s.official_assister
   from fixture_scores s join members m on m.id = s.member_id where s.fixture_id = ${fixtureId} and m.display_name = ${name}`)[0];
 const status = async () => (await sql<{ scoringStatus: string; reviewReason: string | null }[]>`select scoring_status, review_reason from fixtures where id = ${fixtureId}`)[0];
@@ -35,6 +39,13 @@ function form(ag: number, og: number, scorer: string, assister: string, extra: P
     assisterState: st(assister), assisterName: st(assister) === 'named' ? assister : '',
     firstGoalOwnGoal: false, firstGoalUnassisted: false, status: 'finished', notesPrivate: '', publicNote: '', ...extra,
   };
+}
+
+/** Save a (corrected) result; if the match is already scored, apply it with the explicit rescore. */
+async function publish(f: ManualResultForm) {
+  const r = await saveManualResult(jon, fixtureId, f);
+  if (!r.ok || r.finalise?.status !== 'protected') return r;
+  return { ok: true as const, finalise: await rescoreFixture(jon, fixtureId, 'Correcting the official result') };
 }
 
 before(async () => {
@@ -80,14 +91,15 @@ describe('Explicit scorer/assister states', () => {
 });
 
 describe('Typed names are matched reliably', () => {
-  test('case and spacing differences still match; breakdown is stored', async () => {
+  test('case and spacing differences still match; breakdown is stored (first scoring: 20-point rules)', async () => {
     const r = await saveManualResult(jon, fixtureId, form(2, 1, '  martin   ødegaard ', 'BEN WHITE'));
     assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
     const t = await scoreRow('Tipple');
-    assert.deepEqual([t.scorerPoints, t.assisterPoints, t.resultPoints, t.totalGoalsPoints, t.bonusPoints, t.totalPoints], [5, 5, 1, 1, 3, 15]);
+    assert.equal(t.rulesVersion, 2);
+    assert.deepEqual([t.exactScorePoints, t.scorerPoints, t.assisterPoints, t.resultPoints, t.totalGoalsPoints, t.bonusPoints, t.totalPoints], [5, 5, 5, 1, 1, 3, 20]);
     assert.equal(t.predictedScorer, 'Martin Ødegaard');
     const h = await scoreRow('Henry');
-    assert.deepEqual([h.scorerPoints, h.assisterPoints, h.bonusPoints, h.totalPoints], [3, 3, 0, 8], 'both crossovers via surname/no-accent picks');
+    assert.deepEqual([h.exactScorePoints, h.scorerPoints, h.assisterPoints, h.bonusPoints, h.totalPoints], [5, 3, 3, 0, 13], 'both crossovers via surname/no-accent picks; no bonus');
     const l = await scoreRow('Liam');
     assert.equal(l.totalPoints, 0, 'Havertz wrong, "no assister" wrong, 1-1 v 2-1 wrong result and total');
   });
@@ -97,7 +109,7 @@ describe('Typed names are matched reliably', () => {
     assert.equal(c.n, 6);
   });
 
-  test('saving the same result again does not change anything', async () => {
+  test('saving the same result again does not change anything (and does not rescore)', async () => {
     const before = await matchPoints('Tipple');
     for (let i = 0; i < 3; i++) await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
     assert.equal(await matchPoints('Tipple'), before);
@@ -106,24 +118,24 @@ describe('Typed names are matched reliably', () => {
   });
 
   test('apostrophes and hyphens: curly apostrophe and en dash still match exactly', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(3, 0, 'Myles Lewis–Skelly', 'Kieran O’Brien'));
+    const r = await publish(form(3, 0, 'Myles Lewis–Skelly', 'Kieran O’Brien'));
     assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
     const g = await scoreRow('Gareth');
-    assert.deepEqual([g.scorerPoints, g.assisterPoints, g.resultPoints, g.totalGoalsPoints, g.bonusPoints], [5, 5, 1, 1, 3]);
+    assert.deepEqual([g.exactScorePoints, g.scorerPoints, g.assisterPoints, g.resultPoints, g.totalGoalsPoints, g.bonusPoints, g.totalPoints], [5, 5, 5, 1, 1, 3, 20]);
   });
 });
 
 describe('Closest match to the official names', () => {
   test('missing accent in the OFFICIAL name still matches members who typed the accent', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Odegaard', 'Ben White'));
+    const r = await publish(form(2, 1, 'Martin Odegaard', 'Ben White'));
     assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
-    assert.equal((await scoreRow('Tipple')).totalPoints, 15);
+    assert.equal((await scoreRow('Tipple')).totalPoints, 20);
     const { rows } = await checkPredictions(fixtureId);
     assert.equal(rows.find((x) => x.displayName === 'Tipple')!.scorerMatchNote, 'matched "Martin Odegaard"');
   });
 
   test('a small typo in a longer name matches; a typo in a short name does not', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
+    const r = await publish(form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
     assert.ok(r.ok && r.finalise?.status === 'finalised');
     // Liam typed "Havertz" (exact surname): 5. Mike typed "Sakka" for the scorer and "Saka" for the assister.
     assert.equal((await scoreRow('Liam')).scorerPoints, 5);
@@ -132,20 +144,23 @@ describe('Closest match to the official names', () => {
     assert.equal(m.assisterPoints, 5, '"Saka" matches Bukayo Saka');
   });
 
-  test('a pick that fits both official players is held for an admin, then scored as no match', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Gabriel Martinelli', 'Gabriel Magalhães'));
+  test('a pick that fits both official players is held for an admin (existing points kept), then scored as no match', async () => {
+    const before = await matchPoints('Brooksy');
+    const r = await publish(form(1, 0, 'Gabriel Martinelli', 'Gabriel Magalhães'));
     assert.ok(r.ok && r.finalise?.status === 'blocked');
-    assert.match((await status()).reviewReason!, /Brooksy: "Gabriel" could be "Gabriel Magalhães" or "Gabriel Martinelli"/);
-    assert.equal(await matchPoints('Brooksy'), 0, 'nothing published while held');
+    assert.match((r.finalise as { reason: string }).reason, /Brooksy: "Gabriel" could be "Gabriel Magalhães" or "Gabriel Martinelli"/);
+    assert.match((r.finalise as { reason: string }).reason, /Existing points were left unchanged/);
+    assert.equal(await matchPoints('Brooksy'), before, 'a blocked rescore never removes published points');
     const c = await confirmNameReview(jon, fixtureId);
-    assert.equal(c.status, 'finalised');
+    assert.equal(c.status, 'protected', 'confirming the names does not rescore by itself');
+    assert.equal((await rescoreFixture(jon, fixtureId, 'Gabriel picks ruled as no match')).status, 'finalised');
     assert.equal((await scoreRow('Brooksy')).assisterPoints, 0);
   });
 });
 
 describe('Substitutions', () => {
   test('picking the player who was replaced counts as the substitute who scored', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka', { scorerReplaced: 'Leandro Trossard' }));
+    const r = await publish(form(1, 0, 'Kai Havertz', 'Bukayo Saka', { scorerReplaced: 'Leandro Trossard' }));
     assert.ok(r.ok && r.finalise?.status === 'finalised', JSON.stringify(r));
     const b = await scoreRow('Brooksy');
     assert.equal(b.scorerPoints, 5, 'Trossard pick → Havertz came on for Trossard and scored');
@@ -156,7 +171,7 @@ describe('Substitutions', () => {
   });
 
   test('the substitution rule also gives the 3-point crossover', async () => {
-    await saveManualResult(jon, fixtureId, form(1, 0, 'Bukayo Saka', 'Kai Havertz', { assisterReplaced: 'Leandro Trossard' }));
+    await publish(form(1, 0, 'Bukayo Saka', 'Kai Havertz', { assisterReplaced: 'Leandro Trossard' }));
     const b = await scoreRow('Brooksy');
     assert.equal(b.scorerPoints, 3, 'Trossard picked to score; his replacement Havertz made the first assist');
   });
@@ -168,8 +183,8 @@ describe('Substitutions', () => {
     assert.equal(bad2.ok, false);
   });
 
-  test('removing the substitution recalculates without it', async () => {
-    await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
+  test('removing the substitution and rescoring scores without it', async () => {
+    await publish(form(1, 0, 'Kai Havertz', 'Bukayo Saka'));
     assert.equal((await scoreRow('Brooksy')).scorerPoints, 0);
   });
 });
@@ -193,7 +208,7 @@ describe('Kick-off lock', () => {
 
 describe('Confirmed no assist, own goals', () => {
   test('confirmed "no credited assist" scores the "No assister" pick', async () => {
-    await saveManualResult(jon, fixtureId, form(1, 0, 'Kai Havertz', 'none', { firstGoalUnassisted: true }));
+    await publish(form(1, 0, 'Kai Havertz', 'none', { firstGoalUnassisted: true }));
     const l = await scoreRow('Liam');
     assert.deepEqual([l.scorerPoints, l.assisterPoints, l.resultPoints, l.totalGoalsPoints], [5, 5, 0, 0]);
     assert.equal(l.officialAssister, '(none)');
@@ -201,7 +216,7 @@ describe('Confirmed no assist, own goals', () => {
   });
 
   test('an own goal never credits a named goalscorer', async () => {
-    const r = await saveManualResult(jon, fixtureId, form(1, 0, 'none', 'none', { firstGoalOwnGoal: true }));
+    const r = await publish(form(1, 0, 'none', 'none', { firstGoalOwnGoal: true }));
     assert.ok(r.ok && r.finalise?.status === 'finalised');
     for (const who of ['Tipple', 'Henry', 'Liam', 'Gareth', 'Brooksy', 'Mike']) assert.equal((await scoreRow(who)).scorerPoints, 0, who);
   });
@@ -212,19 +227,21 @@ describe('Security and consistency', () => {
     const bob = { id: await member('Bob'), displayName: 'Bob' };
     await assert.rejects(saveManualResult(bob, fixtureId, form(5, 0, 'Kai Havertz', 'none')), /Only an administrator/);
     await assert.rejects(confirmNameReview(bob, fixtureId), /Only an administrator/);
+    await assert.rejects(rescoreFixture(bob, fixtureId, 'Trying to change the points'), /Only an administrator/);
+    await assert.rejects(reopenScoring(bob, fixtureId, 'Trying to remove the points'), /Only an administrator/);
     const [r] = await sql<{ arsenalGoals: number }[]>`select arsenal_goals from match_results where fixture_id = ${fixtureId}`;
     assert.equal(r.arsenalGoals, 1, 'unchanged');
   });
 
-  test('manual adjustments survive result edits', async () => {
+  test('manual adjustments survive result edits and rescores', async () => {
     const tipple = await member('Tipple');
     await addAdjustment(jon, tipple, 4, 'Bonus for organising the night out', null);
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Gabriel Martinelli', 'Gabriel Magalhães')); // held: points withdrawn
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White'));
+    await publish(form(2, 1, 'Martin Ødegaard', 'Ben White'));
+    await publish(form(2, 1, 'Gabriel Martinelli', 'Gabriel Magalhães')); // held: existing points kept
+    await publish(form(2, 1, 'Martin Ødegaard', 'Ben White'));
     const [t] = await sql<{ openingPoints: number; matchPoints: number; adjustmentPoints: number; totalPoints: number }[]>`
       select opening_points, match_points, adjustment_points, total_points from member_totals where display_name = 'Tipple'`;
-    assert.deepEqual(t, { openingPoints: 30, matchPoints: 15, adjustmentPoints: 4, totalPoints: 49 });
+    assert.deepEqual(t, { openingPoints: 30, matchPoints: 20, adjustmentPoints: 4, totalPoints: 54 });
   });
 
   test('leaderboard totals always equal opening + stored fixture scores + adjustments', async () => {
@@ -236,9 +253,12 @@ describe('Security and consistency', () => {
     assert.equal(bad.n, 0);
   });
 
-  test('an abandoned match withdraws and awards nothing', async () => {
-    await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White', { status: 'abandoned' }));
-    assert.equal((await status()).scoringStatus, 'void');
+  test('a scored match cannot be marked abandoned from the result form; points only leave via "Withdraw points"', async () => {
+    const r = await saveManualResult(jon, fixtureId, form(2, 1, 'Martin Ødegaard', 'Ben White', { status: 'abandoned' }));
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /Withdraw points/);
+    assert.equal(await matchPoints('Tipple'), 20, 'unchanged');
+    await reopenScoring(jon, fixtureId, 'Match abandoned after the event');
     assert.equal(await matchPoints('Tipple'), 0);
   });
 });

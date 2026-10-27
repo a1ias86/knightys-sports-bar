@@ -22,13 +22,17 @@ function official(kind: StoredResult['firstScorerKind'] | undefined, name: strin
 }
 
 /** Per-member comparison with the official result, plus the stored point breakdown once scored. */
-export function ScoringTable({ checks, scores, result, finalised, overrides }: {
+export function ScoringTable({ checks, scores, result, finalised, overrides, rulesVersion }: {
   checks: PredictionCheck[];
   scores: Map<string, Score>;
   result: StoredResult | null;
   finalised: boolean;
   overrides: Map<string, string>;
+  /** Rules this match was / will be scored with. 1 = original 15-point (no exact-score column). */
+  rulesVersion: 1 | 2;
 }) {
+  const showExact = rulesVersion === 2;
+  const exactOk = result ? (c: PredictionCheck) => c.arsenalGoals === result.arsenalGoals && c.opponentGoals === result.opponentGoals : null;
   const actualCat = result ? resultCategory(result.arsenalGoals, result.opponentGoals) : null;
   const actualTotal = result ? result.arsenalGoals + result.opponentGoals : null;
   return (
@@ -40,6 +44,7 @@ export function ScoringTable({ checks, scores, result, finalised, overrides }: {
             <th>Predicted score</th>
             <th>First goalscorer</th>
             <th>First assister</th>
+            {showExact && <th className="r">Exact</th>}
             <th className="r">Scorer</th>
             <th className="r">Assist</th>
             <th className="r">Result</th>
@@ -52,7 +57,7 @@ export function ScoringTable({ checks, scores, result, finalised, overrides }: {
             <td className="num">{result ? `${result.arsenalGoals}–${result.opponentGoals} (${RESULT_WORD[actualCat!]}, ${actualTotal} goals)` : 'Not entered'}</td>
             <td>{official(result?.firstScorerKind, result?.firstScorerName, 'No qualifying goal', result?.firstScorerReplacedName)}</td>
             <td>{official(result?.firstAssisterKind, result?.firstAssisterName, 'No credited assist', result?.firstAssisterReplacedName)}</td>
-            <td colSpan={6} className="small muted">{result?.playerCategoriesVoid ? `Scorer/assist not scored: ${result.voidReason}` : ''}</td>
+            <td colSpan={showExact ? 7 : 6} className="small muted">{result?.playerCategoriesVoid ? `Scorer/assist not scored: ${result.voidReason}` : ''}</td>
           </tr>
         </thead>
         <tbody>
@@ -80,6 +85,7 @@ export function ScoringTable({ checks, scores, result, finalised, overrides }: {
                   {c.assisterPick ?? 'None'} <span className={`verdict ${VERDICT[c.assisterVerdict].cls}`}>{VERDICT[c.assisterVerdict].label}</span>
                   {c.assisterMatchNote && <div className="small muted">{c.assisterMatchNote}</div>}
                 </td>
+                {showExact && <td className="r num">{finalised && s ? (s.exactScorePoints ?? '–') : (exactOk === null ? '–' : exactOk(c) ? '✓' : '✗')}</td>}
                 <td className="r num">{pts(s?.scorerPoints)}</td>
                 <td className="r num">{pts(s?.assisterPoints)}</td>
                 <td className="r num">{pts(s?.resultPoints)}</td>

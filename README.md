@@ -10,8 +10,9 @@ A private prediction league for 32 Arsenal fans. Members log in with their name 
 |---|---|
 | Login | Name dropdown + 4-digit PIN. Server-side checks, hashed PINs, lockouts, 30-day sessions (7 for admins). |
 | Dashboard | Next fixture as a scoreboard, countdown to the deadline, your position and points, recent results, table preview. |
-| Predictions | Score, searchable first-goalscorer and first-assister pickers, confirmation step, editable until kick-off, locked on the server at kick-off. |
+| Predictions | Score plus typed first goalscorer and first assister, confirmation step, editable until kick-off, locked on the server at kick-off. 20-point scoring (see docs/SCORING.md). |
 | Table | Opening balances + match points + adjustments, competition ranking (1, 2, 2, 4), top-three podium, form and movement. |
+| Hall of Fame | Public page of past season champions, managed by admins. |
 | Match centre | Result, first scorer/assister, everyone's locked picks after kick-off with a points breakdown. |
 | Admin | Members & PINs, fixtures, manual results, verification, recalculation, points adjustments, players, settings, feed status, audit log, JSON backup. |
 | Automation | Provider adapter (API-Football or football-data.org), Vercel Cron daily job, frequent "matchday" endpoint, opportunistic result checks. |
@@ -49,6 +50,7 @@ Then open `/setup`, enter your `ADMIN_SETUP_TOKEN`, and note the PINs shown for 
 | `npm run db:seed` | Load members/opening balances (never overwrites existing data) |
 | `npm run admin:setup` | CLI alternative to `/setup` |
 | `npm run export` | JSON backup to `exports/` (no PINs or hashes) |
+| `npm run league:snapshot` | Read-only baseline of the table and all protected records; `-- --compare <file>` checks nothing changed |
 
 ## Project layout
 

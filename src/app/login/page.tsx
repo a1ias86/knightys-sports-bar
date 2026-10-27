@@ -31,6 +31,7 @@ export default async function LoginPage() {
             <LoginForm names={names} />
           )}
           <p className="small muted" style={{ marginTop: 20 }}>Forgotten your PIN? Ask Jon or Knighty for a new one.</p>
+          <p className="small"><Link href="/hall-of-fame">See the Hall of Fame</Link></p>
         </div>
       </div>
     </div>

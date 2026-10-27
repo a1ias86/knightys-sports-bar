@@ -81,7 +81,11 @@ export function syncFixtures() {
           created++;
           return;
         }
-        if (target.manualOverride || target.scoringStatus === 'finalised') {
+        // Never change a match that is locked by an admin or has ever been scored (its points are protected).
+        const [{ scoredBefore }] = await tx<{ scoredBefore: boolean }[]>`
+          select (exists (select 1 from fixture_scores where fixture_id = ${target.id})
+               or exists (select 1 from scoring_runs where fixture_id = ${target.id} and status = 'success')) as scored_before`;
+        if (target.manualOverride || target.scoringStatus === 'finalised' || scoredBefore) {
           await tx`update fixtures set last_synced_at = now() where id = ${target.id}`;
           return;
         }

@@ -1,17 +1,6 @@
--- Knighty's Sports Bar: initial data.
--- Safe to re-run: never duplicates members, never resets PINs, never overwrites opening balances.
-
-insert into competitions (code, name, enabled) values
-  ('PL',  'Premier League',          true),
-  ('FAC', 'FA Cup',                  false),
-  ('EFL', 'EFL Cup',                 false),
-  ('UCL', 'UEFA Champions League',   false)
-on conflict (code) do nothing;
-
-insert into settings (key, value) values
-  ('reveal_predictions_after_kickoff', 'true'::jsonb),
-  ('competition_name', '"Arsenal Men''s Prediction League"'::jsonb)
-on conflict (key) do nothing;
+-- Knighty's Sports Bar: the initial 32 members, admins and opening balances.
+-- Runs ONLY on an empty database (scripts/seed.ts checks first). It is never re-run against a live league,
+-- so renamed members, changed roles and corrected balances are never recreated or overwritten.
 
 drop table if exists pg_temp.seed_roster;
 create temporary table seed_roster (name text, role text, opening int);

@@ -20,7 +20,8 @@
     "db:setup": "tsx scripts/migrate.ts && tsx scripts/seed.ts",
     "admin:setup": "tsx scripts/admin-setup.ts",
     "export": "tsx scripts/export.ts",
-    "vercel-build": "tsx scripts/migrate.ts --if-configured && tsx scripts/seed.ts --if-configured && next build"
+    "vercel-build": "tsx scripts/migrate.ts --if-configured && tsx scripts/seed.ts --if-configured && next build",
+    "league:snapshot": "tsx scripts/league-snapshot.ts"
   },
   "dependencies": {
     "@fontsource/barlow": "^5.3.0",

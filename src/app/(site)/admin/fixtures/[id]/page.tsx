@@ -3,7 +3,8 @@ import { notFound } from 'next/navigation';
 import { requireAdmin } from '@/lib/session';
 import { getFixture, listCompetitions, displayStatus } from '@/lib/fixtures';
 import { predictionsForFixture } from '@/lib/predictions';
-import { getResult, getFeed, fixtureScores, matchEvents, checkPredictions } from '@/lib/results';
+import { getResult, getFeed, fixtureScores, matchEvents, checkPredictions, getScoringInfo } from '@/lib/results';
+import { MAX_POINTS } from '@/lib/scoring';
 import { OfficialPlayerField } from './OfficialPlayerField';
 import { ScoringTable } from './ScoringTable';
 import { sql } from '@/lib/db';
@@ -13,7 +14,7 @@ import { ActionForm } from '@/components/ActionForm';
 import { FixtureFields } from '@/components/FixtureFields';
 import {
   updateFixtureAction, fixtureSyncToggleAction, manualResultAction, verifyResultAction, voidPlayerCategoriesAction,
-  reopenAction, recalcFixtureAction, overridePredictionAction, confirmNameReviewAction,
+  reopenAction, rescoreFixtureAction, overridePredictionAction, confirmNameReviewAction,
 } from '../../actions';
 
 export const metadata = { title: 'Manage fixture' };
@@ -34,6 +35,8 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
     sql<{ id: string; displayName: string }[]>`select id, display_name from members where is_active order by lower(display_name)`,
   ]);
   const scoreBy = new Map(scores.map((s) => [s.memberId, s]));
+  const scoring = await getScoringInfo(sql, id);
+  const isFresh = scoring.state === 'fresh';
   const { rows: checks } = await checkPredictions(id);
   const reviewRows = fixture.scoringStatus === 'finalised' ? [] : checks.filter((c) => c.reviewNotes.length > 0);
   const overrides = new Map(preds.filter((p) => p.overrideReason).map((p) => [p.memberId, p.overrideReason!]));
@@ -55,7 +58,8 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
         </div>
       </div>
       {created && <Alert kind="ok">Fixture added. Members can predict until kick-off.</Alert>}
-      {fixture.reviewReason && !finalised && <Alert kind="warn">{fixture.reviewReason}</Alert>}
+      <ScoringStatePanel state={scoring.state} rules={MAX_POINTS[scoring.rulesVersion]} note={scoring.note} />
+      {fixture.reviewReason && !finalised && isFresh && <Alert kind="warn">{fixture.reviewReason}</Alert>}
       {feed?.discrepancy && <Alert kind="warn">Feed discrepancy: {feed.discrepancy} Your entered result has been kept. Correct it below if the feed is right, or press Verify to confirm yours.</Alert>}
 
       <div className="grid-2">
@@ -84,27 +88,38 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
             <p className="small muted">Feed ({feed.provider}) last checked {formatDateTime(feed.fetchedAt)}: {feed.arsenalGoals ?? '?'}–{feed.opponentGoals ?? '?'}, {feed.status}.</p>
           )}
           <div className="row" style={{ marginTop: 12 }}>
-            {r && !finalised && fixture.status === 'finished' && (
+            {r && isFresh && fixture.status === 'finished' && (
               <ActionForm action={verifyResultAction} submitLabel="Verify and score" submitClass="btn btn-red btn-small" confirm="Confirm this result is correct and publish the points?">
                 <input type="hidden" name="fixtureId" value={id} />
               </ActionForm>
             )}
-            {finalised && (
-              <ActionForm action={recalcFixtureAction} submitLabel="Recalculate" submitClass="btn btn-ghost btn-small">
-                <input type="hidden" name="fixtureId" value={id} />
-              </ActionForm>
-            )}
           </div>
-          {finalised && (
+          {!isFresh && (
             <details className="inline" style={{ marginTop: 16 }}>
-              <summary>Withdraw points to correct this match</summary>
-              <ActionForm action={reopenAction} submitLabel="Reopen scoring" submitClass="btn btn-danger btn-small" confirm="Withdraw this match's points from the table until it is finalised again?">
+              <summary>Rescore this match</summary>
+              <p className="small muted">
+                Only if this match&rsquo;s points are wrong. It recalculates this one match from the result above, using the
+                {' '}{MAX_POINTS[scoring.rulesVersion]}-point rules it was {scoring.state === 'ambiguous' && scoring.successfulRuns === 0 ? 'set to use' : 'originally scored with'},
+                and replaces its points in the table. Every change is recorded in the audit log with your reason.
+              </p>
+              <ActionForm action={rescoreFixtureAction} submitLabel="Rescore this match" submitClass="btn btn-danger btn-small" confirm="Recalculate this match's points and update the table?">
                 <input type="hidden" name="fixtureId" value={id} />
-                <div className="field"><label htmlFor="reopen-reason">Reason</label><input id="reopen-reason" name="reason" type="text" required minLength={5} /></div>
+                <div className="field"><label htmlFor="rescore-reason">Reason (at least 10 characters)</label><input id="rescore-reason" name="reason" type="text" required minLength={10} /></div>
+                <div className="field"><label htmlFor="rescore-confirm">Type RESCORE to confirm</label><input id="rescore-confirm" name="confirm" type="text" required pattern="RESCORE" autoComplete="off" /></div>
               </ActionForm>
             </details>
           )}
-          {r && !finalised && fixture.status === 'finished' && (
+          {finalised && (
+            <details className="inline" style={{ marginTop: 16 }}>
+              <summary>Withdraw this match&rsquo;s points</summary>
+              <p className="small muted">Takes this match&rsquo;s points out of the table (for example, if it&rsquo;s later abandoned). They only come back with &ldquo;Rescore this match&rdquo;.</p>
+              <ActionForm action={reopenAction} submitLabel="Withdraw points" submitClass="btn btn-danger btn-small" confirm="Take this match's points out of the table?">
+                <input type="hidden" name="fixtureId" value={id} />
+                <div className="field"><label htmlFor="reopen-reason">Reason (at least 10 characters)</label><input id="reopen-reason" name="reason" type="text" required minLength={10} /></div>
+              </ActionForm>
+            </details>
+          )}
+          {r && isFresh && fixture.status === 'finished' && (
             <details className="inline" style={{ marginTop: 16 }}>
               <summary>No reliable scorer/assist data anywhere?</summary>
               <p className="small muted">Competition ruling: finalise with goalscorer and assister picks scoring 0 for everyone. Result and total goals still count. Recorded in the audit log and shown to members.</p>
@@ -128,7 +143,11 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
 
         <section className="panel">
           <h2>{r ? 'Correct the result' : 'Enter the result'}</h2>
-          <p className="small muted">Uses the same scoring as automatic results. Your entry is treated as verified and won&rsquo;t be overwritten by the feed.</p>
+          <p className="small muted">
+            {isFresh
+              ? `Publishing scores this match for the first time with the ${MAX_POINTS[scoring.rulesVersion]}-point rules. Your entry is treated as verified and won’t be overwritten by the feed.`
+              : 'This match is already scored. Saving a correction here updates the result only: points stay as they are until you use “Rescore this match”.'}
+          </p>
           <ActionForm action={manualResultAction} submitLabel="Publish result" submitClass="btn btn-red">
             <input type="hidden" name="fixtureId" value={id} />
             <div className="score-entry" style={{ marginBottom: 16 }}>
@@ -178,7 +197,7 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
           </div>
         )}
         {checks.length === 0 ? <p className="muted">No predictions yet.</p> : (
-          <ScoringTable checks={checks} scores={scoreBy} result={r} finalised={finalised} overrides={overrides} />
+          <ScoringTable checks={checks} scores={scoreBy} result={r} finalised={finalised} overrides={overrides} rulesVersion={scoring.rulesVersion} />
         )}
         <p className="small muted">Green = correct (5). Amber = crossover (3). Red = no match. &ldquo;Check&rdquo; = could be either official player, waiting for you. &ldquo;Waiting&rdquo; = the official answer isn&rsquo;t entered or is unknown. {finalised ? 'Points shown are the stored, published breakdown.' : 'No points are published until the match is scored.'}</p>
         <details className="inline" style={{ marginTop: 16 }}>
@@ -223,4 +242,17 @@ export default async function FixtureAdmin({ params, searchParams }: { params: P
       </section>
     </div>
   );
+}
+
+function ScoringStatePanel({ state, rules, note }: { state: 'fresh' | 'scored' | 'withdrawn' | 'ambiguous'; rules: number; note: string | null }) {
+  if (state === 'fresh') {
+    return <Alert kind="info">Not scored yet. This match will be scored with the <strong>{rules}-point rules</strong> when its result is published.</Alert>;
+  }
+  if (state === 'scored') {
+    return <Alert kind="info"><strong>Protected:</strong> scored with the {rules}-point rules. Saving, verifying, the data feed and prediction overrides never change these points; only &ldquo;Rescore this match&rdquo; can.</Alert>;
+  }
+  if (state === 'withdrawn') {
+    return <Alert kind="warn"><strong>Points withdrawn.</strong> This match was scored with the {rules}-point rules, then its points were taken out of the table. {note}</Alert>;
+  }
+  return <Alert kind="error"><strong>Needs checking.</strong> {note} Nothing will change this match automatically.</Alert>;
 }

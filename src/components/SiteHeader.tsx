@@ -10,6 +10,7 @@ const LINKS = [
   { href: '/matches', label: 'Matches' },
   { href: '/table', label: 'Table' },
   { href: '/history', label: 'My predictions' },
+  { href: '/hall-of-fame', label: 'Hall of Fame' },
   { href: '/rules', label: 'Rules' },
 ];
 

@@ -10,7 +10,7 @@ import { savePrediction, adminOverridePrediction, getPrediction } from '../../sr
 import { createFixture, updateFixture, type FixtureInput } from '../../src/lib/fixtures';
 import {
   saveManualResult, finaliseFixture, applyFeedMatch, verifyResult, finaliseWithPlayerCategoriesVoid,
-  reopenScoring, type FeedMatch, type ManualResultForm,
+  reopenScoring, rescoreFixture, type FeedMatch, type ManualResultForm,
 } from '../../src/lib/results';
 import { getLeaderboard } from '../../src/lib/leaderboard';
 import type { Actor } from '../../src/lib/audit';
@@ -73,13 +73,15 @@ describe('Seed and opening standings', () => {
     assert.equal((await total('Mark D')).openingPoints, 33);
   });
 
-  test('re-running the seed changes nothing', async () => {
+  test('re-running the deploy-time seed leaves an existing league untouched (incl. renames and roles)', async () => {
     await sql`update opening_balances set points = 99 where member_id = ${await memberId('Tony')}`;
+    await sql`update members set display_name = 'Jakey' where display_name = 'Jake'`;
     await runSeedAgain();
     const [c] = await sql<{ n: number }[]>`select count(*)::int as n from members`;
-    assert.equal(c.n, 32);
+    assert.equal(c.n, 32, 'the renamed member is not recreated');
     assert.equal((await total('Tony')).openingPoints, 99, 'seed must not overwrite an existing balance');
     await sql`update opening_balances set points = 18 where member_id = ${await memberId('Tony')}`;
+    await sql`update members set display_name = 'Jake' where display_name = 'Jakey'`;
   });
 
   test('leaderboard positions use competition ranking and match the imported table', async () => {
@@ -273,17 +275,18 @@ describe('Scoring persistence', () => {
     const steffBefore = (await total('Steff')).totalPoints; // 48
     const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, 'Saka', 'Rice'));
     assert.ok(r.ok && r.finalise?.status === 'finalised');
-    // Ant: 1-0, Saka, Rice -> 15 (full house)
-    assert.equal((await total('Ant')).totalPoints, antBefore + 15);
-    // Steff: 2-0, Saka, Rice -> 5+5+1 = 11 (total wrong)
+    // New match → 20-point rules. Ant: exact 1-0, Saka, Rice → 5+5+5+1+1+3 = 20 (full house)
+    assert.equal((await total('Ant')).totalPoints, antBefore + 20);
+    // Steff: 2-0, Saka, Rice → scorer 5 + assister 5 + result 1 = 11 (not exact, total wrong)
     assert.equal((await total('Steff')).totalPoints, steffBefore + 11);
     const t = await total('Ant');
     assert.equal(t.totalPoints, t.openingPoints + t.matchPoints + t.adjustmentPoints);
   });
 
-  test('recalculating repeatedly never duplicates points', async () => {
+  test('automatic scoring never touches a scored match; explicit rescoring never duplicates points', async () => {
     const before = await total('Ant');
-    for (let i = 0; i < 3; i++) await finaliseFixture(ids.chelsea, jon, 'test');
+    for (let i = 0; i < 3; i++) assert.equal((await finaliseFixture(ids.chelsea, jon, 'test')).status, 'protected');
+    for (let i = 0; i < 2; i++) assert.equal((await rescoreFixture(jon, ids.chelsea, 'Checking it is idempotent')).status, 'finalised');
     assert.deepEqual(await total('Ant'), before);
     const [c] = await sql<{ n: number }[]>`select count(*)::int as n from fixture_scores where fixture_id = ${ids.chelsea}`;
     assert.equal(c.n, 2);
@@ -293,28 +296,37 @@ describe('Scoring persistence', () => {
     const ant = await memberId('Ant');
     assert.equal((await addAdjustment(jon, ant, 2, '', null)).ok, false, 'reason required');
     assert.ok((await addAdjustment(jon, ant, -2, 'Late prediction penalty', ids.chelsea)).ok);
-    await finaliseFixture(ids.chelsea, jon, 'test');
+    await rescoreFixture(jon, ids.chelsea, 'Rescore after the penalty');
     const t = await total('Ant');
     assert.equal(t.openingPoints, 17);
-    assert.equal(t.matchPoints, 15);
+    assert.equal(t.matchPoints, 20);
     assert.equal(t.adjustmentPoints, -2);
-    assert.equal(t.totalPoints, 30);
+    assert.equal(t.totalPoints, 35);
   });
 
-  test('correcting the scorer recalculates (replaces, not adds)', async () => {
+  test('correcting a scored result does NOT change points; the explicit rescore replaces them (never adds)', async () => {
     const r = await saveManualResult(jon, ids.chelsea, manual(1, 0, 'Rice', 'Saka'));
-    assert.ok(r.ok);
-    // Ant picked Saka (scorer) / Rice (assister): both crossovers now -> 3+3+1+1 = 8
-    assert.equal((await total('Ant')).matchPoints, 8);
+    assert.ok(r.ok && r.finalise?.status === 'protected');
+    assert.equal((await total('Ant')).matchPoints, 20, 'unchanged by the edit');
     const [aud] = await sql<{ n: number }[]>`select count(*)::int as n from audit_log where action = 'result.corrected'`;
     assert.equal(aud.n, 1);
+    await rescoreFixture(jon, ids.chelsea, 'Scorer and assister were the wrong way round');
+    // Ant picked Saka (scorer) / Rice (assister): exact 5 + crossovers 3+3 + total 1 + result 1 = 13
+    assert.equal((await total('Ant')).matchPoints, 13);
+    const [e] = await sql<{ details: { reason: string; rulesVersion: number } }[]>`
+      select details from audit_log where action = 'scoring.rescored_explicitly' order by id desc limit 1`;
+    assert.equal(e.details.reason, 'Scorer and assister were the wrong way round');
+    assert.equal(e.details.rulesVersion, 2);
   });
 
-  test('reopening withdraws the fixture points until it is finalised again', async () => {
+  test('withdrawing points takes them out; they only return through an explicit rescore', async () => {
+    assert.equal((await reopenScoring(jon, ids.chelsea, 'short')).ok, false, 'reason too short');
     await reopenScoring(jon, ids.chelsea, 'Checking the replay');
     assert.equal((await total('Ant')).matchPoints, 0);
-    await finaliseFixture(ids.chelsea, jon, 'test', { confirmReview: true });
-    assert.equal((await total('Ant')).matchPoints, 8);
+    assert.equal((await finaliseFixture(ids.chelsea, jon, 'test', { confirmReview: true })).status, 'protected', 'no automatic re-publish');
+    assert.equal((await total('Ant')).matchPoints, 0);
+    await rescoreFixture(jon, ids.chelsea, 'Replay checked, result confirmed');
+    assert.equal((await total('Ant')).matchPoints, 13);
   });
 
   test('a manual result with an invalid outcome is rejected', async () => {
@@ -364,10 +376,10 @@ describe('Automatic feed processing', () => {
     const msg = await applyFeedMatch(id, 'test', feed);
     assert.match(msg, /finalised/);
     assert.equal(await status(id), 'finalised');
-    assert.equal((await total('Mark D')).matchPoints, before + 15);
+    assert.equal((await total('Mark D')).matchPoints, before + 20, 'exact 2-1 + Saka + Odegaard + total + result + bonus');
     // Second identical feed run: unchanged, no extra points.
-    assert.equal(await applyFeedMatch(id, 'test', feed), 'unchanged');
-    assert.equal((await total('Mark D')).matchPoints, before + 15);
+    assert.equal(await applyFeedMatch(id, 'test', feed), 'protected: unchanged');
+    assert.equal((await total('Mark D')).matchPoints, before + 20);
   });
 
   test('a later, less complete feed never withdraws finalised points', async () => {
@@ -377,18 +389,20 @@ describe('Automatic feed processing', () => {
     assert.equal((await total('Mark D')).matchPoints, before);
   });
 
-  test('a provider correction to the scorer is applied and recalculated', async () => {
+  test('a provider correction to a scored match is flagged, never applied automatically', async () => {
     const before = (await total('Mark D')).matchPoints;
+    const [r0] = await sql<{ firstScorerName: string }[]>`select first_scorer_name from match_results where fixture_id = ${ids.spurs}`;
     const feed: FeedMatch = {
       status: 'finished', arsenalGoals: 2, opponentGoals: 1,
       goals: [goal('g1', 10, 'Havertz', 'Odegaard'), goal('g2', 30, 'Son', null, 'opponent'), goal('g3', 80, 'Saka', null)],
       substitutions: [],
     };
-    await applyFeedMatch(ids.spurs, 'test', feed);
-    // Mark: Saka (scorer pick) no longer first scorer, Odegaard still assister -> 0+5+1+1 = 7 (was 15)
-    assert.equal((await total('Mark D')).matchPoints, before - 8);
-    const [a] = await sql<{ n: number }[]>`select count(*)::int as n from audit_log where action = 'result.feed_correction'`;
-    assert.equal(a.n, 1);
+    assert.equal(await applyFeedMatch(ids.spurs, 'test', feed), 'protected: discrepancy flagged');
+    assert.equal((await total('Mark D')).matchPoints, before, 'points unchanged');
+    const [r1] = await sql<{ firstScorerName: string }[]>`select first_scorer_name from match_results where fixture_id = ${ids.spurs}`;
+    assert.equal(r1.firstScorerName, r0.firstScorerName, 'stored result unchanged');
+    const [d] = await sql<{ discrepancy: string }[]>`select discrepancy from feed_results where fixture_id = ${ids.spurs}`;
+    assert.match(d.discrepancy, /Points were not changed/);
   });
 
   test('missing assist data holds the match', async () => {
@@ -399,7 +413,7 @@ describe('Automatic feed processing', () => {
     const before = (await total('Mark D')).matchPoints;
     const r = await finaliseWithPlayerCategoriesVoid(jon, id, 'No reliable assist data from any source');
     assert.equal(r.status, 'finalised');
-    // Mark predicted 2-1 v 1-0: result 1, total 0 -> 1
+    // Mark predicted 2-1 v 1-0: not exact, result 1, total 0 -> 1
     assert.equal((await total('Mark D')).matchPoints, before + 1);
   });
 
@@ -414,7 +428,7 @@ describe('Automatic feed processing', () => {
     const before = (await total('Mark D')).matchPoints;
     const r = await verifyResult(jon, id);
     assert.equal(r.status, 'finalised');
-    // Mark: Saka/Odegaard correct, 2-1 v 2-0: result 1, total 0 -> 11
+    // Mark: Saka/Odegaard correct, 2-1 v 2-0: not exact, result 1, total 0 -> 11
     assert.equal((await total('Mark D')).matchPoints, before + 11);
   });
 
@@ -427,7 +441,7 @@ describe('Automatic feed processing', () => {
       goals: [goal('f1', 5, 'Havertz', null), goal('f2', 20, 'Saka', null), goal('f3', 30, 'Rice', null), goal('f4', 40, 'X', null, 'opponent')],
       substitutions: [],
     });
-    assert.equal(msg, 'discrepancy flagged');
+    assert.equal(msg, 'protected: discrepancy flagged');
     assert.equal((await total('Mark D')).matchPoints, before);
     const [r] = await sql<{ arsenalGoals: number; source: string }[]>`select arsenal_goals, source from match_results where fixture_id = ${id}`;
     assert.deepEqual(r, { arsenalGoals: 2, source: 'manual' });

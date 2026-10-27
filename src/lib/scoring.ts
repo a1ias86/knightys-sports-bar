@@ -1,10 +1,17 @@
 /**
  * Knighty's Sports Bar: the single, centralised scoring engine.
  *
+ * TWO RULE VERSIONS (see docs/SCORING.md):
+ *  - Version 1 (original, max 15): used for every match scored before the 20-point rules were introduced.
+ *    Its behaviour must never change; existing points depend on it.
+ *  - Version 2 (current, max 20): adds 5 points for the exact scoreline; the full house needs all five
+ *    primary categories. Used only for matches scored for the first time under the new rules.
+ * Version 1 is the default here, so nothing can be scored under the new rules by accident.
+ *
  * Pure functions only: no database, no clock, no I/O. Every route that awards points
  * (manual results, automatic results, recalculation) goes through `scorePrediction`.
  *
- * Competition rules (beta):
+ * Version 1 rules:
  *  - Correct first goalscorer ............................ 5
  *  - Correct first assister .............................. 5
  *  - Picked goalscorer instead made the first assist ..... 3 (replaces the 5, never added to it)
@@ -73,7 +80,14 @@ export interface PredictionInput {
 
 export type PlayerAwardOutcome = 'correct' | 'crossover' | 'incorrect' | 'void';
 
+export type RulesVersion = 1 | 2;
+/** The rules used when a match is scored for the first time. */
+export const CURRENT_RULES_VERSION: RulesVersion = 2;
+export const MAX_POINTS: Record<RulesVersion, number> = { 1: 15, 2: 20 };
+
 export interface ScoreOptions {
+  /** Which rules to apply. Defaults to 1 (original). The caller must ask for 2 explicitly. */
+  rulesVersion?: RulesVersion;
   /**
    * Admin decision when reliable scorer/assister data does not exist: both player categories
    * score 0 for every member (no full house possible); result and total goals still count.
@@ -82,6 +96,9 @@ export interface ScoreOptions {
 }
 
 export interface ScoreBreakdown {
+  rulesVersion: RulesVersion;
+  /** Version 2 only: 5 for the exact scoreline. Null under version 1 (category didn't exist). */
+  exactScorePoints: number | null;
   scorerPoints: number;
   scorerOutcome: PlayerAwardOutcome;
   assisterPoints: number;
@@ -96,6 +113,7 @@ export const POINTS = {
   scorer: 5,
   assister: 5,
   crossover: 3,
+  exactScore: 5,
   result: 1,
   totalGoals: 1,
   fullHouseBonus: 3,
@@ -225,6 +243,8 @@ function samePlayer(pick: Pick, actual: FirstPlayer): boolean {
 
 /** Score one member's prediction against a settled outcome. Throws if the outcome is not scoreable. */
 export function scorePrediction(p: PredictionInput, o: MatchOutcome, opts: ScoreOptions = {}): ScoreBreakdown {
+  const rulesVersion: RulesVersion = opts.rulesVersion ?? 1;
+  if (rulesVersion !== 1 && rulesVersion !== 2) throw new Error(`Unknown scoring rules version ${String(rulesVersion)}`);
   const playerVoid = opts.playerCategoriesVoid === true;
   if (playerVoid) {
     assertGoals(o.arsenalGoals, 'Arsenal goals');
@@ -265,10 +285,18 @@ export function scorePrediction(p: PredictionInput, o: MatchOutcome, opts: Score
   const resultPoints = resultCorrect ? POINTS.result : 0;
   const totalGoalsPoints = totalCorrect ? POINTS.totalGoals : 0;
 
-  const fullHouse = scorerOutcome === 'correct' && assisterOutcome === 'correct' && resultCorrect && totalCorrect;
+  // Version 2: exact scoreline (both scores right).
+  const exactCorrect = p.arsenalGoals === o.arsenalGoals && p.opponentGoals === o.opponentGoals;
+  const exactScorePoints = rulesVersion === 2 ? (exactCorrect ? POINTS.exactScore : 0) : null;
+
+  // Full house: every primary category fully correct. Crossovers (3) and void picks never qualify.
+  const fullHouse = scorerOutcome === 'correct' && assisterOutcome === 'correct' && resultCorrect && totalCorrect
+    && (rulesVersion === 1 || exactCorrect);
   const bonusPoints = fullHouse ? POINTS.fullHouseBonus : 0;
 
   return {
+    rulesVersion,
+    exactScorePoints,
     scorerPoints,
     scorerOutcome,
     assisterPoints,
@@ -276,7 +304,7 @@ export function scorePrediction(p: PredictionInput, o: MatchOutcome, opts: Score
     resultPoints,
     totalGoalsPoints,
     bonusPoints,
-    totalPoints: scorerPoints + assisterPoints + resultPoints + totalGoalsPoints + bonusPoints,
+    totalPoints: (exactScorePoints ?? 0) + scorerPoints + assisterPoints + resultPoints + totalGoalsPoints + bonusPoints,
   };
 }
 

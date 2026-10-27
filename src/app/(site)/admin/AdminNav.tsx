@@ -8,6 +8,7 @@ const LINKS = [
   ['/admin/fixtures', 'Fixtures & results'],
   ['/admin/members', 'Members & PINs'],
   ['/admin/points', 'Points'],
+  ['/admin/hall-of-fame', 'Hall of Fame'],
   ['/admin/settings', 'Settings'],
   ['/admin/audit', 'Audit log'],
 ] as const;

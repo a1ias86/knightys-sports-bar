@@ -3,7 +3,7 @@ import { listMembers, listAdjustments } from '@/lib/members';
 import { sql } from '@/lib/db';
 import { formatDateTime } from '@/lib/time';
 import { ActionForm } from '@/components/ActionForm';
-import { adjustmentAction, recalcAllAction } from '../actions';
+import { adjustmentAction } from '../actions';
 
 export const metadata = { title: 'Points' };
 
@@ -26,7 +26,7 @@ export default async function PointsAdmin() {
       <div className="grid-2">
         <section className="panel">
           <h2>Manual adjustment</h2>
-          <p className="small muted">Kept separate from match points, so recalculating a match never removes it. Use a negative number to take points away. To correct an opening balance, add an adjustment with the reason.</p>
+          <p className="small muted">Kept separate from match points, so rescoring a match never removes it. Use a negative number to take points away. To correct an opening balance, add an adjustment with the reason.</p>
           <ActionForm action={adjustmentAction} submitLabel="Record adjustment" submitClass="btn btn-red" confirm="Record this points adjustment?">
             <div className="form-grid">
               <div className="field"><label htmlFor="adj-member">Member</label><select id="adj-member" name="memberId" required>{active.map((m) => <option key={m.id} value={m.id}>{m.displayName}</option>)}</select></div>
@@ -47,7 +47,7 @@ export default async function PointsAdmin() {
             <div><b className="num">{sum('adjustmentPoints')}</b><span>adjustments</span></div>
             <div><b className="num">{sum('totalPoints')}</b><span>total</span></div>
           </div>
-          <ActionForm action={recalcAllAction} submitLabel="Recalculate every scored match" submitClass="btn btn-ghost btn-small" confirm="Rescore every finalised match from its stored result? Opening balances and adjustments are not touched." />
+          <p className="small muted">There is no &ldquo;recalculate everything&rdquo; button: points for an already-scored match only change when an admin rescores that one match, with a reason.</p>
         </section>
       </div>
 

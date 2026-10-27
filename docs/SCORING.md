@@ -1,16 +1,46 @@
 # Scoring rules
 
-All points come from one function: `scorePrediction` in `src/lib/scoring.ts`. Manual results, automatic results and recalculations all call it.
+All points come from one function: `scorePrediction` in `src/lib/scoring.ts`. Manual results, the data feed and the explicit rescore all call it. It has **two rule versions**.
+
+## Current rules: 20-point (version 2)
 
 | Category | Points |
 |---|---:|
+| Correct exact scoreline | 5 |
 | Correct first goalscorer | 5 |
 | Correct first assister | 5 |
 | Goalscorer pick made the first assist instead (crossover) | 3, replacing the 5 |
 | Assister pick scored the first goal instead (crossover) | 3, replacing the 5 |
-| Correct result (Arsenal win / draw / Arsenal loss) | 1 |
 | Correct combined total of goals | 1 |
-| Full house: scorer 5 + assister 5 + result + total all correct | +3 (max 15) |
+| Correct result (Arsenal win / draw / Arsenal loss) | 1 |
+| Full house: exact score + scorer 5 + assister 5 + total + result | +3 (max **20**) |
+
+Categories are scored independently: an exact score also earns the total-goals and result points. Crossovers never count towards the full house.
+
+## Original rules: 15-point (version 1)
+
+The same as above but with no exact-score category, and a full house of scorer 5 + assister 5 + result + total (max 15). **Every match scored before the 20-point rules keeps these rules and its stored points.** Version 1 is the engine's default, so the new rules can't be applied by accident.
+
+## Which matches get which rules (protecting the existing league)
+
+Each match's scoring state is derived from records that already existed: stored points (`fixture_scores`) and the permanent scoring history (`scoring_runs`). No dates, scores or flags are used, and existing rows were not updated to add this.
+
+| State | How it's recognised | What happens |
+|---|---|---|
+| Never scored | no stored points, no successful scoring run | Scored once, automatically, with the **20-point** rules when its result is first published |
+| Scored | has stored points (or a successful run and is finalised) | **Protected.** Never rescored automatically. |
+| Withdrawn | was scored, points later withdrawn by an admin | **Protected.** Comes back only via "Rescore this match", with its original rules |
+| Needs checking | inconsistent records, e.g. finalised with no scoring history, or points on a match not marked finalised | **Protected, flagged** on the admin overview; left untouched |
+
+A match that already has predictions but has never been scored counts as "never scored": it uses the 20-point rules when its result is first published.
+
+**Nothing automatic changes a protected match's points:** saving or correcting its result, Verify, the name-check confirmation, the "no reliable data" ruling, admin prediction overrides, the data feed and the scheduled fixture sync all leave them as they are. The only ways are explicit, single-match admin actions, both recorded in the audit log with a reason:
+- **Withdraw points**: takes that match's points out of the table.
+- **Rescore this match**: needs a reason and typing RESCORE. It recalculates that one match from its stored result with the rules it was originally scored with, and logs every member's change.
+
+There is no "recalculate every match" button.
+
+Each stored point row records `rules_version` (2 for new matches; blank for matches scored under the original rules) and `exact_score_points`.
 
 ## Definitions used by the engine
 
@@ -48,13 +78,13 @@ The official first goalscorer and first assister are typed as names (no dropdown
 
 **Stored breakdown:** every member's row in `fixture_scores` records the points per category plus a snapshot of their predicted score and picks and the official score and names used, so any award can be audited later.
 
-## Note on the brief's examples A and B
+## Note on the original brief's examples A and B
 
-The brief's Examples A and B both predict Arsenal 3–1 against an actual 2–2 and award the result point. Under the written result rule, 3–1 (Arsenal win) and 2–2 (draw) are different results, so the engine does **not** award it: Example A scores 11 (not 15) and Example B scores 1 (not 2). Both readings are covered by tests in `tests/unit/scoring.test.ts`. If the league wants a different rule, it is a one-line change in `scorePrediction` followed by **Admin → Points → Recalculate every scored match**.
+The brief's Examples A and B both predict Arsenal 3–1 against an actual 2–2 and award the result point. Under the written result rule, 3–1 (Arsenal win) and 2–2 (draw) are different results, so the engine does **not** award it: Example A scores 11 (not 15) and Example B scores 1 (not 2). Both readings are covered by tests in `tests/unit/scoring.test.ts`. (This applies to both rule versions.)
 
 ## Persistence guarantees
 
 - One prediction per member per fixture (unique constraint); edits update the same row and keep the first submission time.
-- Scoring a fixture runs in one transaction with the fixture row locked: old awards for that fixture are deleted and replaced. Running it again produces identical totals.
+- Scoring runs in one transaction with the fixture row locked; a failure leaves the table exactly as it was. Repeating it never adds points: automatic paths do nothing once a match is scored, and an explicit rescore replaces that one match's points.
 - Opening balances (`opening_balances`) and manual adjustments (`point_adjustments`) are separate tables that scoring never touches.
 - `member_totals` view: total = opening + finalised match points + adjustments. Admin → Points shows a live reconciliation check.

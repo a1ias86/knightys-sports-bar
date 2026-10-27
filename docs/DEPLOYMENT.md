@@ -69,6 +69,12 @@ Preview deployments point at the preview database, so testing never touches live
 - The Vercel build runs `migrate.ts --if-configured`, then `seed.ts --if-configured` (never overwrites existing data), then `next build`, so a deployment applies pending migrations to *its* database (preview → preview DB, production → production DB) before building. If a migration fails, the build fails and the previous deployment keeps serving.
 - The runner refuses `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM` unless the file is named `*.destructive.sql` **and** `ALLOW_DESTRUCTIVE_MIGRATIONS=1` is set for that one run. Take a backup first and run those by hand.
 
+## 6a. League protection on every deploy
+
+- **League guard:** every database migration and the setup step runs inside a transaction that fingerprints the protected league data before and after: table totals, members, opening balances, adjustments, match points, scoring history, results and predictions. If anything differs, the change is rolled back and the deploy fails, so the live site keeps running the previous version.
+- **Setup step:** the 32 initial members and opening balances are only inserted into an **empty** database. A live league is never re-seeded, so renamed members, changed roles and corrected balances are never recreated or overwritten.
+- **Baseline snapshot (read-only):** `DIRECT_URL="<session pooler URI>" npm run league:snapshot` saves every member's points and position plus all protected records to `exports/league-baseline-<time>.json`. Later, `npm run league:snapshot -- --compare <file>` lists any difference (exit code 1 if anything changed). It runs in a read-only transaction and never writes. Files in `exports/` are git-ignored; keep them private.
+
 ## 7. Scheduled jobs
 
 `vercel.json` defines one cron: `/api/cron/daily` at 06:00 UTC (fixtures, squads, missed results).

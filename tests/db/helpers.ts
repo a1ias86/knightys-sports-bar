@@ -22,17 +22,15 @@ export async function resetDatabase() {
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) {
       await admin.unsafe(readFileSync(join(dir, f), 'utf8'));
     }
-    await admin.unsafe(readFileSync(join(process.cwd(), 'db', 'seed.sql'), 'utf8'));
+    await admin.unsafe(readFileSync(join(process.cwd(), 'db', 'seed-config.sql'), 'utf8'));
+    await admin.unsafe(readFileSync(join(process.cwd(), 'db', 'seed-members.sql'), 'utf8'));
   } finally {
     await admin.end();
   }
 }
 
+/** Runs the real deploy-time seed script (which must leave an existing league untouched). */
 export async function runSeedAgain() {
-  const admin = postgres(testUrl!, { max: 1, onnotice: () => {} });
-  try {
-    await admin.unsafe(readFileSync(join(process.cwd(), 'db', 'seed.sql'), 'utf8'));
-  } finally {
-    await admin.end();
-  }
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('npx', ['tsx', 'scripts/seed.ts'], { env: { ...process.env, DIRECT_URL: testUrl, DATABASE_URL: testUrl }, stdio: 'pipe' });
 }

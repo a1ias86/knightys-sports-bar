@@ -118,9 +118,23 @@ describe('Results synchronisation', () => {
     assert.equal(r.status, 'success');
     assert.equal(calls, 1, 'only the one due fixture was requested');
     const [t] = await sql<{ matchPoints: number }[]>`select match_points from member_totals where display_name = 'Bob'`;
-    assert.equal(t.matchPoints, 15);
+    assert.equal(t.matchPoints, 20, 'exact 1-0 + Saka + Odegaard + total + result + bonus');
     calls = 0;
     await syncResults();
     assert.equal(calls, 0, 'a finalised fixture is not fetched again');
+  });
+
+  test('the fixture sync never reschedules or cancels a match that has been scored', async () => {
+    const [before] = await sql<{ kickoffAt: Date; status: string; scoringStatus: string }[]>`
+      select kickoff_at, status, scoring_status from fixtures where provider_fixture_id = '101'`;
+    await sql`update fixtures set manual_override = false where provider_fixture_id = '101'`;
+    const i = fixtures.findIndex((f) => f.providerFixtureId === '101');
+    fixtures[i] = { ...fixtures[i], status: 'cancelled', kickoffAt: days(40) };
+    await syncFixtures();
+    const [after] = await sql<{ kickoffAt: Date; status: string; scoringStatus: string }[]>`
+      select kickoff_at, status, scoring_status from fixtures where provider_fixture_id = '101'`;
+    assert.deepEqual(after, before);
+    const [t] = await sql<{ matchPoints: number }[]>`select match_points from member_totals where display_name = 'Bob'`;
+    assert.equal(t.matchPoints, 20);
   });
 });

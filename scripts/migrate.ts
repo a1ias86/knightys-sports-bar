@@ -7,6 +7,9 @@
  *    running at once can't apply the same migration twice. Works through either Supabase pooler.
  *  - Files containing DROP TABLE / DROP COLUMN / TRUNCATE / DELETE FROM are refused unless the file name
  *    contains ".destructive." AND ALLOW_DESTRUCTIVE_MIGRATIONS=1 is set for that one run, after a backup.
+ *  - LEAGUE GUARD: inside each migration's transaction the protected league data (table totals, members, opening
+ *    balances, adjustments, match points, scoring history, results, predictions; see protected-data.ts) is
+ *    fingerprinted before and after. Any difference rolls the migration back and fails the deploy.
  *
  * Usage: npm run db:migrate            (uses DIRECT_URL, falling back to DATABASE_URL)
  *        tsx scripts/migrate.ts --if-configured   (used by the Vercel build; skips if no DB URL set)
@@ -15,6 +18,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { connectForScript } from './db-connect';
+import { presentColumns, fingerprint, diffFingerprints, type Runner } from './protected-data';
 
 const ifConfigured = process.argv.includes('--if-configured');
 const DESTRUCTIVE = /\b(drop\s+table|drop\s+column|truncate|delete\s+from|drop\s+schema)\b/i;
@@ -53,7 +57,16 @@ async function main() {
           throw new Error(`${file} contains a destructive statement. Back up the database, rename it *.destructive.sql and run with ALLOW_DESTRUCTIVE_MIGRATIONS=1.`);
         }
         console.log(`[migrate] applying ${file}`);
+        const run: Runner = (text) => tx.unsafe(text) as unknown as Promise<Record<string, unknown>[]>;
+        const cols = await presentColumns(run);
+        const before = await fingerprint(run, cols);
         await tx.unsafe(body);
+        const after = await fingerprint(run, cols);
+        const changed = diffFingerprints(before, after);
+        if (changed.length) {
+          throw new Error(`${file} would change protected league data, so it was rolled back:\n  ${changed.join('\n  ')}`);
+        }
+        if (before.length) console.log(`[migrate] league guard: ${before.length} protected data sets unchanged by ${file}`);
         await tx`insert into schema_migrations (version, checksum) values (${file}, ${checksum})`;
         return true;
       });

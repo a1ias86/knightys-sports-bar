@@ -27,6 +27,8 @@ export default async function MatchCentre({ params }: { params: Promise<{ id: st
     matchEvents(id),
   ]);
   const scoreBy = new Map(scores.map((s) => [s.memberId, s]));
+  // Breakdowns are shown exactly as stored: matches scored before the 20-point rules have no exact-score column.
+  const twentyPoint = scores.some((s) => s.rulesVersion === 2);
   const status = displayStatus(fixture, !!mine);
   const finalised = fixture.scoringStatus === 'finalised';
   const goalEvents = events.filter((e) => e.eventType !== 'substitution');
@@ -88,7 +90,7 @@ export default async function MatchCentre({ params }: { params: Promise<{ id: st
               <thead>
                 <tr>
                   <th>Member</th><th className="c">Score</th><th>First scorer</th><th>First assist</th>
-                  {finalised && <><th className="r">Scorer</th><th className="r">Assist</th><th className="r">Result</th><th className="r">Goals</th><th className="r">Bonus</th><th className="r">Total</th></>}
+                  {finalised && <>{twentyPoint && <th className="r">Exact</th>}<th className="r">Scorer</th><th className="r">Assist</th><th className="r">Result</th><th className="r">Goals</th><th className="r">Bonus</th><th className="r">Total</th></>}
                 </tr>
               </thead>
               <tbody>
@@ -102,6 +104,7 @@ export default async function MatchCentre({ params }: { params: Promise<{ id: st
                       <td>{p.assisterNone ? 'None' : p.assisterName}</td>
                       {finalised && (
                         <>
+                          {twentyPoint && <td className={`r cat ${s?.exactScorePoints ? 'correct' : ''}`}>{s?.exactScorePoints ?? 0}</td>}
                           <td className={`r cat ${OUTCOME_CLASS[s?.scorerOutcome ?? ''] ?? ''}`}>{s?.scorerPoints ?? 0}</td>
                           <td className={`r cat ${OUTCOME_CLASS[s?.assisterOutcome ?? ''] ?? ''}`}>{s?.assisterPoints ?? 0}</td>
                           <td className="r">{s?.resultPoints ?? 0}</td>
@@ -118,7 +121,10 @@ export default async function MatchCentre({ params }: { params: Promise<{ id: st
           </div>
         )}
         {finalised && rows.length > 0 && (
-          <p className="small muted" style={{ marginTop: 12 }}>Green = correct pick (5). Amber = crossover: your scorer made the first assist, or your assister scored first (3).</p>
+          <p className="small muted" style={{ marginTop: 12 }}>
+            Scored with the {twentyPoint ? '20' : '15'}-point rules{twentyPoint ? '' : ' (this match was scored before the 20-point rules started)'}.
+            Green = correct (5). Amber = crossover: your scorer made the first assist, or your assister scored first (3).
+          </p>
         )}
       </section>
     </div>

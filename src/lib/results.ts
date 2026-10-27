@@ -2,8 +2,8 @@ import { sql, type Db, type Tx } from './db';
 import { audit, type Actor } from './audit';
 import { getFixture, type FixtureStatus } from './fixtures';
 import {
-  scorePrediction, isScoreable, validateOutcome, deriveOutcome,
-  type MatchOutcome, type FirstPlayer, type GoalEvent, type Pick as PlayerPick,
+  scorePrediction, isScoreable, validateOutcome, deriveOutcome, CURRENT_RULES_VERSION, MAX_POINTS,
+  type MatchOutcome, type FirstPlayer, type GoalEvent, type Pick as PlayerPick, type RulesVersion,
 } from './scoring';
 import { cleanName, nameKey, validateName, matchPickToOfficial } from './names';
 
@@ -201,48 +201,118 @@ export async function checkPredictions(fixtureId: string, db: Db = sql): Promise
 // ─── Scoring a fixture ────────────────────────────────────────
 
 export type FinaliseResult =
-  | { status: 'finalised'; scored: number; runId: string }
-  | { status: 'blocked'; reason: string; scoringStatus: 'awaiting_verification' | 'review_required' | 'not_ready' | 'void' };
+  | { status: 'finalised'; scored: number; runId: string; rulesVersion: RulesVersion }
+  | { status: 'blocked'; reason: string; scoringStatus: 'awaiting_verification' | 'review_required' | 'not_ready' | 'void' }
+  | { status: 'protected'; reason: string; state: ScoringState };
+
+// ─── Protecting matches that have already been scored ─────────
+
+/**
+ * fresh     never scored: no stored points and no successful scoring run. Scored automatically, once, with the
+ *           current (20-point) rules.
+ * scored    has stored points (or a successful run and is finalised). Protected: never rescored automatically.
+ * withdrawn was scored, then its points were withdrawn by an admin. Protected: needs an explicit rescore.
+ * ambiguous inconsistent records (e.g. marked finalised with no scoring history). Protected and flagged; left
+ *           untouched until an admin decides.
+ */
+export type ScoringState = 'fresh' | 'scored' | 'withdrawn' | 'ambiguous';
+
+export interface ScoringInfo {
+  state: ScoringState;
+  /** Rules this match was scored with (protected) or will be scored with (fresh). */
+  rulesVersion: RulesVersion;
+  pointRows: number;
+  successfulRuns: number;
+  note: string | null;
+}
+
+export async function getScoringInfo(db: Db, fixtureId: string): Promise<ScoringInfo> {
+  const [r] = await db<{
+    scoringStatus: string; pointRows: number; versions: number; rowVersion: number | null; runs: number; runVersion: number | null;
+  }[]>`
+    select f.scoring_status,
+      (select count(*)::int from fixture_scores s where s.fixture_id = f.id) as point_rows,
+      (select count(distinct coalesce(s.rules_version, 1))::int from fixture_scores s where s.fixture_id = f.id) as versions,
+      (select max(coalesce(s.rules_version, 1))::int from fixture_scores s where s.fixture_id = f.id) as row_version,
+      (select count(*)::int from scoring_runs r where r.fixture_id = f.id and r.status = 'success') as runs,
+      (select coalesce((r.outcome->>'rulesVersion')::int, 1) from scoring_runs r
+        where r.fixture_id = f.id and r.status = 'success' order by r.created_at desc limit 1) as run_version
+    from fixtures f where f.id = ${fixtureId}`;
+  if (!r) throw new Error('Fixture not found');
+  const v = (n: number | null | undefined): RulesVersion => (n === 2 ? 2 : 1);
+  const base = { pointRows: r.pointRows, successfulRuns: r.runs };
+  if (r.pointRows > 0) {
+    const problems: string[] = [];
+    if (r.versions > 1) problems.push('its stored points use a mix of rule versions');
+    if (r.runs === 0) problems.push('it has stored points but no scoring history');
+    if (r.scoringStatus !== 'finalised') problems.push(`it has stored points but its scoring status is "${r.scoringStatus}", so they aren't counted in the table`);
+    return { ...base, state: problems.length ? 'ambiguous' : 'scored', rulesVersion: v(r.rowVersion), note: problems.length ? `Check this match: ${problems.join('; ')}.` : null };
+  }
+  if (r.runs > 0) {
+    return r.scoringStatus === 'finalised'
+      ? { ...base, state: 'scored', rulesVersion: v(r.runVersion), note: null }
+      : { ...base, state: 'withdrawn', rulesVersion: v(r.runVersion), note: 'Points for this match were withdrawn. Use "Rescore this match" to publish them again.' };
+  }
+  if (r.scoringStatus === 'finalised') {
+    return { ...base, state: 'ambiguous', rulesVersion: CURRENT_RULES_VERSION, note: 'Check this match: it is marked as scored but has no scoring history or points.' };
+  }
+  return { ...base, state: 'fresh', rulesVersion: CURRENT_RULES_VERSION, note: null };
+}
+
+export const PROTECTED_MESSAGE = 'This match has already been scored, so its points were not changed. If they need correcting, use "Rescore this match".';
 
 /**
  * Score every prediction for a fixture and publish the points.
  *
- * Runs in ONE transaction with the fixture row locked: previous calculated awards for this fixture are
- * deleted and replaced, so running it any number of times gives the same totals (idempotent), and a
- * failure part-way leaves the leaderboard exactly as it was. Opening balances and manual adjustments
- * live in other tables and are never touched.
+ * mode 'first'    (default; used by saving results, verifying, the data feed): only scores a FRESH fixture,
+ *                 with the current rules. For any other fixture it changes nothing and returns 'protected'.
+ * mode 'explicit' (the admin "Rescore this match" action, with a recorded reason): replaces this one fixture's
+ *                 points, using the rules it was originally scored with.
  *
- * Players are matched by normalised name (see names.ts). A near-miss name blocks scoring until an admin
- * corrects the official name or confirms the names are different players.
+ * Runs in ONE transaction with the fixture row locked; a failure part-way leaves the table exactly as it was.
+ * Opening balances and manual adjustments live in other tables and are never touched.
  */
 export async function finaliseFixture(
   fixtureId: string,
   actor: Actor | null,
   trigger: string,
-  opts: { confirmReview?: boolean } = {},
+  opts: FinaliseOptions = {},
 ): Promise<FinaliseResult> {
   return sql.begin((tx) => finaliseInTx(tx, fixtureId, actor, trigger, opts));
 }
 
+interface FinaliseOptions { confirmReview?: boolean; mode?: 'first' | 'explicit'; reason?: string }
+
 const NONE_LABEL = '(none)';
 
 async function finaliseInTx(
-  tx: Tx, fixtureId: string, actor: Actor | null, trigger: string, opts: { confirmReview?: boolean },
+  tx: Tx, fixtureId: string, actor: Actor | null, trigger: string, opts: FinaliseOptions,
 ): Promise<FinaliseResult> {
+  const mode = opts.mode ?? 'first';
   const [f] = await tx<{ id: string; status: FixtureStatus; scoringStatus: string }[]>`
     select id, status, scoring_status from fixtures where id = ${fixtureId} for update`;
   if (!f) throw new Error('Fixture not found');
+  const info = await getScoringInfo(tx, fixtureId);
+  if (mode === 'first' && info.state !== 'fresh') {
+    return { status: 'protected', reason: info.note ?? PROTECTED_MESSAGE, state: info.state };
+  }
+  if (mode === 'explicit' && (!actor || !opts.reason || opts.reason.trim().length < 10)) {
+    throw new Error('Rescoring a match needs an admin and a reason of at least 10 characters.');
+  }
+  const rulesVersion = info.rulesVersion;
+  const fresh = info.state === 'fresh';
 
   const block = async (reason: string, scoringStatus: 'awaiting_verification' | 'review_required' | 'not_ready'): Promise<FinaliseResult> => {
-    // Withdraw any previously published points for this fixture: they are no longer reliable.
-    await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
-    await tx`update fixtures set scoring_status = ${scoringStatus}, review_reason = ${reason}, updated_at = now() where id = ${fixtureId}`;
+    // A match that has already been scored keeps its points and status: blocking never removes them.
+    if (fresh) {
+      await tx`update fixtures set scoring_status = ${scoringStatus}, review_reason = ${reason}, updated_at = now() where id = ${fixtureId}`;
+    }
     await tx`insert into scoring_runs (fixture_id, triggered_by, trigger, status, message) values (${fixtureId}, ${actor?.id ?? null}, ${trigger}, 'blocked', ${reason})`;
-    return { status: 'blocked', reason, scoringStatus };
+    return { status: 'blocked', reason: fresh ? reason : `${reason} Existing points were left unchanged.`, scoringStatus };
   };
 
   if (f.status === 'abandoned' || f.status === 'cancelled') {
-    await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
+    if (!fresh) return block(`Match is marked ${f.status}. To remove its points, use "Withdraw points".`, 'review_required');
     await tx`update fixtures set scoring_status = 'void', updated_at = now() where id = ${fixtureId}`;
     return { status: 'blocked', reason: `Match ${f.status}: no points are awarded.`, scoringStatus: 'void' };
   }
@@ -277,11 +347,15 @@ async function finaliseInTx(
     return block(`Some picks match both official players: ${detail}. Decide before scoring.`, 'review_required');
   }
 
+  const before = mode === 'explicit'
+    ? await tx<{ memberId: string; totalPoints: number }[]>`select member_id, total_points from fixture_scores where fixture_id = ${fixtureId}`
+    : [];
+
   const [run] = await tx<{ id: string }[]>`
     insert into scoring_runs (fixture_id, triggered_by, trigger, status, outcome, message)
     values (${fixtureId}, ${actor?.id ?? null}, ${trigger}, 'success',
-            ${tx.json({ ...outcome, scorerName: r.firstScorerName, assisterName: r.firstAssisterName, playerCategoriesVoid: playerVoid } as never)},
-            ${`Scored ${rows.length} prediction(s)`})
+            ${tx.json({ ...outcome, rulesVersion, scorerName: r.firstScorerName, assisterName: r.firstAssisterName, playerCategoriesVoid: playerVoid } as never)},
+            ${`Scored ${rows.length} prediction(s) with the ${MAX_POINTS[rulesVersion]}-point rules`})
     returning id`;
 
   const official = (kind: FirstKind, name: string | null, replaced: string | null) =>
@@ -290,37 +364,48 @@ async function finaliseInTx(
   const pick = (typed: string | null, matchedTo: string | null): PlayerPick =>
     typed === null ? { kind: 'none' } : { kind: 'player', id: nameKey(matchedTo ?? typed) };
 
-  await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
+  // Fresh fixture: nothing to remove. Explicit rescore: this one fixture's points are replaced, deliberately.
+  if (!fresh) await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
   for (const p of rows) {
     const b = scorePrediction(
       { arsenalGoals: p.arsenalGoals, opponentGoals: p.opponentGoals, scorer: pick(p.scorerPick, p.scorerMatchedTo), assister: pick(p.assisterPick, p.assisterMatchedTo) },
       outcome,
-      { playerCategoriesVoid: playerVoid },
+      { playerCategoriesVoid: playerVoid, rulesVersion },
     );
     await tx`
-      insert into fixture_scores (fixture_id, member_id, prediction_id, scorer_points, scorer_outcome, assister_points,
+      insert into fixture_scores (fixture_id, member_id, prediction_id, rules_version, exact_score_points,
+        scorer_points, scorer_outcome, assister_points,
         assister_outcome, result_points, total_goals_points, bonus_points, total_points, scoring_run_id,
         predicted_arsenal_goals, predicted_opponent_goals, predicted_scorer, predicted_assister,
         official_scorer, official_assister, actual_arsenal_goals, actual_opponent_goals)
-      values (${fixtureId}, ${p.memberId}, ${p.predictionId}, ${b.scorerPoints}, ${b.scorerOutcome}, ${b.assisterPoints},
+      values (${fixtureId}, ${p.memberId}, ${p.predictionId}, ${rulesVersion}, ${b.exactScorePoints},
+        ${b.scorerPoints}, ${b.scorerOutcome}, ${b.assisterPoints},
         ${b.assisterOutcome}, ${b.resultPoints}, ${b.totalGoalsPoints}, ${b.bonusPoints}, ${b.totalPoints}, ${run.id},
         ${p.arsenalGoals}, ${p.opponentGoals}, ${p.scorerPick ?? NONE_LABEL}, ${p.assisterPick ?? NONE_LABEL},
         ${official(r.firstScorerKind, r.firstScorerName, r.firstScorerReplacedName)}, ${official(r.firstAssisterKind, r.firstAssisterName, r.firstAssisterReplacedName)},
         ${r.arsenalGoals}, ${r.opponentGoals})`;
   }
   await tx`update fixtures set scoring_status = 'finalised', review_reason = null, updated_at = now() where id = ${fixtureId}`;
-  await audit(tx, actor, f.scoringStatus === 'finalised' ? 'scoring.recalculated' : 'scoring.finalised', 'fixture', fixtureId, {
-    trigger, predictions: rows.length, scoringRunId: run.id,
-  });
-  return { status: 'finalised', scored: rows.length, runId: run.id };
+  if (mode === 'explicit') {
+    const after = await tx<{ memberId: string; totalPoints: number }[]>`select member_id, total_points from fixture_scores where fixture_id = ${fixtureId}`;
+    const b4 = new Map(before.map((x) => [x.memberId, x.totalPoints]));
+    const changes = after.filter((x) => b4.get(x.memberId) !== x.totalPoints).map((x) => ({ memberId: x.memberId, from: b4.get(x.memberId) ?? null, to: x.totalPoints }));
+    await audit(tx, actor, 'scoring.rescored_explicitly', 'fixture', fixtureId, {
+      reason: opts.reason!.trim(), rulesVersion, previousState: info.state, predictions: rows.length, scoringRunId: run.id, changes,
+    });
+  } else {
+    await audit(tx, actor, 'scoring.finalised', 'fixture', fixtureId, { trigger, rulesVersion, predictions: rows.length, scoringRunId: run.id });
+  }
+  return { status: 'finalised', scored: rows.length, runId: run.id, rulesVersion };
 }
 
-/** Recalculate every finalised fixture (e.g. after a rules fix). Each fixture is its own transaction. */
-export async function recalculateAll(actor: Actor) {
-  const ids = await sql<{ id: string }[]>`select id from fixtures where scoring_status = 'finalised' order by kickoff_at`;
-  const out: { fixtureId: string; result: FinaliseResult }[] = [];
-  for (const { id } of ids) out.push({ fixtureId: id, result: await finaliseFixture(id, actor, 'recalculate_all') });
-  return out;
+/** The admin "Rescore this match" action: explicit, one fixture, reason recorded, original rules kept. */
+export async function rescoreFixture(actor: Actor, fixtureId: string, reason: string): Promise<FinaliseResult | { status: 'error'; reason: string }> {
+  if (!reason || reason.trim().length < 10) return { status: 'error', reason: 'Give a reason of at least 10 characters.' };
+  return sql.begin(async (tx) => {
+    await assertAdmin(tx, actor);
+    return finaliseInTx(tx, fixtureId, actor, 'admin_rescore', { mode: 'explicit', reason, confirmReview: true });
+  });
 }
 
 // ─── Manual results ───────────────────────────────────────────
@@ -405,6 +490,12 @@ export async function saveManualResult(actor: Actor, fixtureId: string, form: Ma
     await assertAdmin(tx, actor);
     const f = await getFixture(fixtureId, tx);
     if (!f) return { ok: false as const, error: 'Fixture not found.' };
+    await tx`select 1 from fixtures where id = ${fixtureId} for update`;
+    const info = await getScoringInfo(tx, fixtureId);
+    // An already-scored match: the result can be corrected, but its points and status never change here.
+    if (info.state !== 'fresh' && form.status !== 'finished') {
+      return { ok: false as const, error: 'This match has already been scored. To mark it live or abandoned, first use "Withdraw points" (its points then come out of the table).' };
+    }
     // Store the player's proper spelling when the typed name is an EXACT (case/space-insensitive) match for a
     // known player in this match. Near-misses are left exactly as typed and flagged at scoring time.
     const known = await tx<{ name: string }[]>`
@@ -423,7 +514,7 @@ export async function saveManualResult(actor: Actor, fixtureId: string, form: Ma
     const keepReview = !!before?.nameReviewConfirmed
       && nameKey(before.firstScorerName) === nameKey(scorerName) && nameKey(before.firstAssisterName) === nameKey(assisterName)
       && nameKey(before.firstScorerReplacedName) === nameKey(scorerReplaced) && nameKey(before.firstAssisterReplacedName) === nameKey(assisterReplaced);
-    await tx`
+    const written = await tx<{ fixtureId: string }[]>`
       insert into match_results (fixture_id, arsenal_goals, opponent_goals, source,
         first_scorer_kind, first_scorer_name, first_scorer_player_id, first_assister_kind, first_assister_name, first_assister_player_id,
         first_scorer_replaced_name, first_assister_replaced_name,
@@ -442,12 +533,35 @@ export async function saveManualResult(actor: Actor, fixtureId: string, form: Ma
         first_goal_own_goal = excluded.first_goal_own_goal, first_goal_unassisted = excluded.first_goal_unassisted,
         player_categories_void = false, void_reason = null, name_review_confirmed = excluded.name_review_confirmed, issues = '[]'::jsonb,
         verified = true, verified_by = excluded.verified_by, verified_at = now(),
-        notes_private = excluded.notes_private, public_note = excluded.public_note, updated_at = now()`;
-    await tx`
-      update fixtures set status = ${form.status},
-        scoring_status = case when ${form.status} = 'abandoned' then 'void' else scoring_status end,
-        updated_at = now()
-      where id = ${fixtureId}`;
+        notes_private = excluded.notes_private, public_note = excluded.public_note, updated_at = now()
+      where (match_results.arsenal_goals, match_results.opponent_goals, match_results.source,
+          match_results.first_scorer_kind, match_results.first_scorer_name, match_results.first_scorer_player_id,
+          match_results.first_assister_kind, match_results.first_assister_name, match_results.first_assister_player_id,
+          match_results.first_scorer_replaced_name, match_results.first_assister_replaced_name,
+          match_results.first_goal_own_goal, match_results.first_goal_unassisted, match_results.player_categories_void,
+          match_results.void_reason, match_results.name_review_confirmed, match_results.issues, match_results.verified,
+          match_results.notes_private, match_results.public_note)
+        is distinct from
+        (excluded.arsenal_goals, excluded.opponent_goals, excluded.source,
+          excluded.first_scorer_kind, excluded.first_scorer_name, excluded.first_scorer_player_id,
+          excluded.first_assister_kind, excluded.first_assister_name, excluded.first_assister_player_id,
+          excluded.first_scorer_replaced_name, excluded.first_assister_replaced_name,
+          excluded.first_goal_own_goal, excluded.first_goal_unassisted, excluded.player_categories_void,
+          excluded.void_reason, excluded.name_review_confirmed, excluded.issues, excluded.verified,
+          excluded.notes_private, excluded.public_note)
+      returning fixture_id`;
+    // Saving exactly the same result again is a no-op: nothing is rewritten and nothing is audited.
+    // (Only for already-scored matches; an unscored match still goes on to scoring as normal.)
+    if (before && written.length === 0 && info.state !== 'fresh') {
+      return { ok: true as const, finalise: { status: 'protected' as const, reason: info.note ?? PROTECTED_MESSAGE, state: info.state } };
+    }
+    if (info.state === 'fresh') {
+      await tx`
+        update fixtures set status = ${form.status},
+          scoring_status = case when ${form.status} = 'abandoned' then 'void' else scoring_status end,
+          updated_at = now()
+        where id = ${fixtureId}`;
+    }
     await audit(tx, actor, before ? 'result.corrected' : 'result.entered', 'fixture', fixtureId, {
       before: before ? resultSummary(before) : null,
       after: {
@@ -458,12 +572,10 @@ export async function saveManualResult(actor: Actor, fixtureId: string, form: Ma
       },
     });
     let finalise: FinaliseResult | null = null;
-    // Finished → score. Abandoned → finaliseInTx voids the fixture and removes any stored awards.
-    if (form.status === 'finished' || form.status === 'abandoned') finalise = await finaliseInTx(tx, fixtureId, actor, 'manual_result', { confirmReview: true });
-    else if (form.status === 'live') {
-      await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
-      await tx`update fixtures set scoring_status = 'not_ready' where id = ${fixtureId}`;
-    }
+    // Fresh match: finished → first scoring (current rules); abandoned → void. Scored match: points untouched.
+    if (info.state !== 'fresh') finalise = { status: 'protected', reason: info.note ?? PROTECTED_MESSAGE, state: info.state };
+    else if (form.status === 'finished' || form.status === 'abandoned') finalise = await finaliseInTx(tx, fixtureId, actor, 'manual_result', { confirmReview: true });
+    else if (form.status === 'live') await tx`update fixtures set scoring_status = 'not_ready' where id = ${fixtureId}`;
     return { ok: true as const, finalise };
   });
 }
@@ -526,15 +638,19 @@ export async function finaliseWithPlayerCategoriesVoid(actor: Actor, fixtureId: 
   });
 }
 
-/** Withdraw published points for a fixture (e.g. to correct it). Totals drop back immediately. */
+/**
+ * Explicit admin action: withdraw one match's published points (they come out of the table). The match then
+ * needs an explicit "Rescore this match" to publish them again, with its original rules.
+ */
 export async function reopenScoring(actor: Actor, fixtureId: string, reason: string) {
-  if (!reason || reason.trim().length < 5) return { ok: false as const, error: 'Give a reason.' };
+  if (!reason || reason.trim().length < 10) return { ok: false as const, error: 'Give a reason of at least 10 characters.' };
   await sql.begin(async (tx) => {
     await assertAdmin(tx, actor);
     await tx`select 1 from fixtures where id = ${fixtureId} for update`;
+    const removed = await tx<{ memberId: string; totalPoints: number }[]>`select member_id, total_points from fixture_scores where fixture_id = ${fixtureId}`;
     await tx`delete from fixture_scores where fixture_id = ${fixtureId}`;
     await tx`update fixtures set scoring_status = 'review_required', review_reason = ${'Reopened: ' + reason.trim()}, updated_at = now() where id = ${fixtureId}`;
-    await audit(tx, actor, 'scoring.reopened', 'fixture', fixtureId, { reason: reason.trim() });
+    await audit(tx, actor, 'scoring.reopened', 'fixture', fixtureId, { reason: reason.trim(), removed });
   });
   return { ok: true as const };
 }
@@ -598,9 +714,11 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
     const f = await getFixture(fixtureId, tx);
     if (!f) return 'missing fixture';
     await tx`select 1 from fixtures where id = ${fixtureId} for update`;
+    const info = await getScoringInfo(tx, fixtureId);
+    const fresh = info.state === 'fresh';
 
-    // Status changes from the feed (unless an admin has locked this fixture).
-    if (!f.manualOverride && feed.status !== f.status && f.scoringStatus !== 'finalised') {
+    // Status changes from the feed (unless an admin has locked this fixture, or it has ever been scored).
+    if (fresh && !f.manualOverride && feed.status !== f.status && f.scoringStatus !== 'finalised') {
       await tx`update fixtures set status = ${feed.status}, data_source = 'automatic', last_synced_at = now(), updated_at = now() where id = ${fixtureId}`;
       if (feed.status === 'abandoned' || feed.status === 'cancelled') {
         await tx`update fixtures set scoring_status = 'void', review_reason = ${'Feed reports match ' + feed.status} where id = ${fixtureId}`;
@@ -682,6 +800,16 @@ export async function applyFeedMatch(fixtureId: string, provider: string, feed: 
     }
 
     const existing = await getResult(fixtureId, tx);
+    // Already-scored match: the feed never changes its result or points. Differences are flagged only.
+    if (!fresh) {
+      const same = !!existing && outcomeSignature(outcomeFromResult(existing)) === outcomeSignature(feedOutcome);
+      const scoreSame = !!existing && existing.arsenalGoals === feed.arsenalGoals && existing.opponentGoals === feed.opponentGoals;
+      const msg = same || (scoreSame && derived.issues.length) ? null
+        : `Feed differs from the result this match was scored with (feed ${feed.arsenalGoals}-${feed.opponentGoals}). Points were not changed.`;
+      await tx`update feed_results set discrepancy = ${msg} where fixture_id = ${fixtureId}`;
+      if (msg) await audit(tx, null, 'result.feed_discrepancy', 'fixture', fixtureId, { message: msg });
+      return msg ? 'protected: discrepancy flagged' : 'protected: unchanged';
+    }
     if (existing && existing.source === 'manual') {
       // Admin data wins. Flag (don't apply) any difference.
       const same = outcomeSignature(outcomeFromResult(existing)) === outcomeSignature(feedOutcome);
@@ -744,8 +872,10 @@ export async function fixtureScores(fixtureId: string) {
     memberId: string; displayName: string; scorerPoints: number; scorerOutcome: string; assisterPoints: number; assisterOutcome: string;
     resultPoints: number; totalGoalsPoints: number; bonusPoints: number; totalPoints: number;
     predictedScorer: string | null; predictedAssister: string | null; officialScorer: string | null; officialAssister: string | null;
+    exactScorePoints: number | null; rulesVersion: number | null;
   }[]>`
     select s.member_id, m.display_name, s.scorer_points, s.scorer_outcome, s.assister_points, s.assister_outcome,
+           s.exact_score_points, s.rules_version,
            s.result_points, s.total_goals_points, s.bonus_points, s.total_points,
            s.predicted_scorer, s.predicted_assister, s.official_scorer, s.official_assister
     from fixture_scores s join members m on m.id = s.member_id
